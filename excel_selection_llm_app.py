@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import sys
 import uuid
 import math
 from datetime import datetime, date
@@ -11,8 +12,12 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 import requests
-import win32com.client
-import pythoncom
+try:
+    import win32com.client
+    import pythoncom
+except ImportError:
+    win32com = None
+    pythoncom = None
 
 
 # =========================================================
@@ -165,11 +170,301 @@ def format_number(x, digits: int = 2) -> str:
     return f"{x:,.{digits}f}"
 
 
+MONTH_TOKEN_PATTERN = re.compile(
+    r"^("
+    r"\d{6}|"
+    r"\d{4}[-/]\d{1,2}|"
+    r"\d{2}년\s?\d{1,2}월|"
+    r"\d{1,2}월|"
+    r"jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec"
+    r")$",
+    re.IGNORECASE,
+)
+
+DATE_TOKEN_PATTERN = re.compile(
+    r"^("
+    r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|"
+    r"\d{4}\.\d{1,2}\.\d{1,2}|"
+    r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}|"
+    r"\d{4}년\s?\d{1,2}월\s?\d{1,2}일"
+    r")$",
+    re.IGNORECASE,
+)
+
+TOTAL_ROW_PATTERN = re.compile(r"(합계|총계|subtotal|sub-total|grand total|total|ttl)", re.IGNORECASE)
+ID_HEADER_PATTERN = re.compile(r"(?:^|[_\s-])(id|code|no|part|lot|serial|model)(?:$|[_\s-])", re.IGNORECASE)
+PERCENT_HEADER_PATTERN = re.compile(r"(%|비율|rate|ratio|점유율|pct)", re.IGNORECASE)
+
+
+def normalize_text_token(value) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().lower()
+
+
+def is_missing_value(value) -> bool:
+    return value is None or (isinstance(value, str) and not value.strip())
+
+
+def is_percent_like_value(value) -> bool:
+    if isinstance(value, str) and "%" in value:
+        return True
+    number = safe_float(value)
+    return number is not None and 0 <= number <= 1
+
+
+def is_month_like_value(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (datetime, date)):
+        return False
+    token = normalize_text_token(value)
+    if not token:
+        return False
+    return bool(MONTH_TOKEN_PATTERN.fullmatch(token))
+
+
+def is_date_like_value(value) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, (datetime, date)):
+        return True
+    token = normalize_text_token(value)
+    if not token:
+        return False
+    if is_month_like_value(value):
+        return False
+    if DATE_TOKEN_PATTERN.fullmatch(token):
+        return True
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%m/%d/%Y", "%m-%d-%Y", "%d/%m/%Y"):
+        try:
+            datetime.strptime(token, fmt)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def is_id_like_token(value) -> bool:
+    token = normalize_text_token(value)
+    if not token:
+        return False
+    if len(token) < 3:
+        return False
+    if " " in token:
+        return False
+    has_digit = any(ch.isdigit() for ch in token)
+    has_alpha = any(ch.isalpha() for ch in token)
+    return has_digit or ("-" in token and has_alpha)
+
+
+def detect_total_row_indexes(rows: list[dict], headers: list[str]) -> list[int]:
+    total_indexes = []
+    scan_headers = headers[: min(4, len(headers))]
+    for idx, row in enumerate(rows):
+        for header in scan_headers:
+            if TOTAL_ROW_PATTERN.search(normalize_text_token(row.get(header))):
+                total_indexes.append(idx)
+                break
+    return total_indexes
+
+
+def guess_table_topic(headers: list[str]) -> str:
+    joined = " ".join(normalize_text_token(h) for h in headers)
+    if re.search(r"(매출|금액|이익|원가|revenue|sales|profit|cost|amount)", joined):
+        return "financial"
+    if re.search(r"(qty|수량|재고|inventory|stock)", joined):
+        return "quantity_inventory"
+    if re.search(r"(수율|yield|불량|defect|quality|ppm)", joined):
+        return "quality"
+    if re.search(r"(일정|계획|납기|date|schedule|month|week)", joined):
+        return "schedule"
+    return "general"
+
+
+def infer_column_type(header: str, values: list, row_count: int) -> str:
+    non_null_values = [v for v in values if not is_missing_value(v)]
+    if not non_null_values:
+        return "text"
+
+    header_token = normalize_text_token(header)
+    numeric_values = [safe_float(v) for v in non_null_values]
+    numeric_values = [v for v in numeric_values if v is not None]
+    unique_count = len({str(v) for v in non_null_values})
+    unique_ratio = unique_count / len(non_null_values) if non_null_values else 0
+
+    month_like_count = sum(1 for v in non_null_values if is_month_like_value(v))
+    date_like_count = sum(1 for v in non_null_values if is_date_like_value(v))
+    percent_like_count = sum(1 for v in non_null_values if is_percent_like_value(v))
+    id_like_count = sum(1 for v in non_null_values if is_id_like_token(v))
+
+    if month_like_count >= max(2, int(len(non_null_values) * 0.6)):
+        return "month_like"
+    if date_like_count >= max(2, int(len(non_null_values) * 0.6)):
+        return "date_like"
+    numeric_ratio = len(numeric_values) / len(non_null_values) if non_null_values else 0
+
+    if PERCENT_HEADER_PATTERN.search(header) or percent_like_count >= max(2, int(len(non_null_values) * 0.7)):
+        return "percent_like"
+    if numeric_values and numeric_ratio >= 0.6:
+        return "numeric"
+    if ID_HEADER_PATTERN.search(header) or (
+        unique_ratio >= 0.85 and id_like_count >= max(2, int(len(non_null_values) * 0.5))
+    ):
+        return "id_like"
+    if unique_ratio >= 0.95 and row_count >= 5 and ID_HEADER_PATTERN.search(f" {header_token} "):
+        return "id_like"
+    return "text"
+
+
+def choose_label_column(headers: list[str], rows: list[dict], detected_types: dict[str, str]) -> str | None:
+    candidates = []
+    for header in headers:
+        col_type = detected_types.get(header)
+        if col_type in {"id_like", "text"}:
+            values = [row.get(header) for row in rows if not is_missing_value(row.get(header))]
+            if not values:
+                continue
+            unique_ratio = len({str(v) for v in values}) / len(values)
+            score = 0
+            if col_type == "id_like":
+                score += 3
+            if 0.3 <= unique_ratio <= 1.0:
+                score += 2
+            if len(header) <= 20:
+                score += 1
+            candidates.append((score, header))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (-item[0], headers.index(item[1])))
+    return candidates[0][1]
+
+
+def build_value_point(header: str, row_index: int, value: float, row: dict, label_column: str | None) -> dict:
+    point = {"row_index": row_index, "value": value}
+    if label_column and row.get(label_column) is not None:
+        point["label_column"] = label_column
+        point["label_value"] = row.get(label_column)
+    return point
+
+
+def build_numeric_profile(header: str, values: list, data_rows: list[dict], data_indexes: list[int], label_column: str | None, top_n: int) -> dict:
+    numeric_points = []
+    for local_idx, value in enumerate(values):
+        number = safe_float(value)
+        if number is None:
+            continue
+        row = data_rows[local_idx]
+        row_index = data_indexes[local_idx]
+        numeric_points.append(build_value_point(header, row_index, number, row, label_column))
+
+    numeric_vals = [point["value"] for point in numeric_points]
+    total = sum(numeric_vals) if numeric_vals else None
+    avg = (total / len(numeric_vals)) if numeric_vals else None
+    min_v = min(numeric_vals) if numeric_vals else None
+    max_v = max(numeric_vals) if numeric_vals else None
+
+    median = None
+    if numeric_vals:
+        sorted_vals = sorted(numeric_vals)
+        n = len(sorted_vals)
+        if n % 2 == 1:
+            median = sorted_vals[n // 2]
+        else:
+            median = (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2
+
+    top_values = sorted(numeric_points, key=lambda point: (-point["value"], point["row_index"]))[:top_n]
+    bottom_values = sorted(numeric_points, key=lambda point: (point["value"], point["row_index"]))[:top_n]
+
+    return {
+        "count": len(numeric_vals),
+        "null_count": sum(1 for v in values if is_missing_value(v)),
+        "null_ratio": (sum(1 for v in values if is_missing_value(v)) / len(values)) if values else 0,
+        "sum": total,
+        "avg": avg,
+        "min": min_v,
+        "max": max_v,
+        "median": median,
+        "top_values": top_values,
+        "bottom_values": bottom_values,
+    }
+
+
+def build_text_profile(values: list, top_n: int) -> dict:
+    freq = {}
+    for value in values:
+        if is_missing_value(value):
+            continue
+        key = str(value)
+        freq[key] = freq.get(key, 0) + 1
+
+    top_values = sorted(freq.items(), key=lambda item: (-item[1], item[0]))[:top_n]
+    null_count = sum(1 for v in values if is_missing_value(v))
+    return {
+        "count": len(values) - null_count,
+        "null_count": null_count,
+        "null_ratio": (null_count / len(values)) if values else 0,
+        "unique_count": len(freq),
+        "top_values": [{"value": key, "count": count} for key, count in top_values],
+        "value_counts": {key: count for key, count in sorted(freq.items(), key=lambda item: (-item[1], item[0]))[:top_n]},
+    }
+
+
+def analyze_categorical_skew(header: str, profile: dict, row_count: int) -> str | None:
+    if row_count <= 0 or profile["unique_count"] == 0:
+        return None
+    if profile["unique_count"] > max(12, int(row_count * 0.5)):
+        return None
+    top_values = profile.get("top_values") or []
+    if not top_values:
+        return None
+    top_count = top_values[0]["count"]
+    ratio = top_count / row_count
+    if ratio >= 0.7:
+        return f"{header} 컬럼은 '{top_values[0]['value']}'가 {ratio:.0%}로 편중되어 있습니다."
+    return None
+
+
+def build_insight_summary(summary: dict) -> dict:
+    numeric_highlights = []
+    for header in summary["numeric_columns"]:
+        profile = summary["column_profiles"].get(header, {})
+        if profile.get("count", 0) == 0:
+            continue
+        highlight = {
+            "column": header,
+            "avg": profile.get("avg"),
+            "median": profile.get("median"),
+            "min": profile.get("min"),
+            "max": profile.get("max"),
+            "top_values": profile.get("top_values", [])[:3],
+            "bottom_values": profile.get("bottom_values", [])[:3],
+        }
+        numeric_highlights.append(highlight)
+
+    missing_data_warnings = [w for w in summary["warnings"] if "결측률" in w]
+    skew_warnings = [w for w in summary["warnings"] if "편중" in w]
+    total_row_warnings = [w for w in summary["warnings"] if "합계행" in w or "총계행" in w]
+
+    return {
+        "table_topic_guess": summary.get("table_topic_guess", "general"),
+        "numeric_highlights": numeric_highlights,
+        "missing_data_warnings": missing_data_warnings,
+        "skew_warnings": skew_warnings,
+        "total_row_warnings": total_row_warnings,
+        "detected_column_types": summary.get("detected_column_types", {}),
+        "time_columns": summary.get("time_columns", []),
+    }
+
+
 # =========================================================
 # 4) 현재 Excel 선택 영역 읽기
 # =========================================================
 
 def get_current_excel_selection() -> dict:
+    if win32com is None or pythoncom is None:
+        raise RuntimeError("pywin32(win32com, pythoncom) 환경이 없어 Excel 선택영역을 읽을 수 없습니다.")
+
     pythoncom.CoInitialize()
     try:
         try:
@@ -255,73 +550,77 @@ def selection_to_table(selection_data: dict) -> dict:
 def summarize_table(table: dict, top_n: int = 5) -> dict:
     headers = table["headers"]
     rows = table["rows"]
+    total_row_indexes = detect_total_row_indexes(rows, headers)
+    data_rows = [row for idx, row in enumerate(rows) if idx not in total_row_indexes]
+    data_indexes = [idx for idx in range(len(rows)) if idx not in total_row_indexes]
+    table_topic_guess = guess_table_topic(headers)
 
     summary = {
         "row_count": len(rows),
+        "data_row_count": len(data_rows),
         "column_count": len(headers),
         "headers": headers,
         "numeric_columns": [],
         "text_columns": [],
+        "time_columns": [],
         "null_counts": {},
+        "null_ratios": {},
         "column_profiles": {},
+        "detected_column_types": {},
+        "warnings": [],
+        "total_rows_count": len(total_row_indexes),
+        "total_row_indexes": total_row_indexes,
+        "table_topic_guess": table_topic_guess,
     }
 
+    detected_types = {}
+    analysis_rows = data_rows if data_rows else rows
+    analysis_indexes = data_indexes if data_rows else list(range(len(rows)))
+    label_column = None
+
     col_values = {h: [] for h in headers}
-    for row in rows:
+    for row in analysis_rows:
         for h in headers:
             col_values[h].append(row.get(h))
 
     for h in headers:
+        detected_types[h] = infer_column_type(h, col_values[h], len(analysis_rows))
+    summary["detected_column_types"] = detected_types
+    summary["time_columns"] = [h for h, col_type in detected_types.items() if col_type in {"date_like", "month_like"}]
+    label_column = choose_label_column(headers, analysis_rows, detected_types)
+
+    for h in headers:
         values = col_values[h]
-        null_count = sum(1 for v in values if v is None)
+        null_count = sum(1 for v in values if is_missing_value(v))
         summary["null_counts"][h] = null_count
+        summary["null_ratios"][h] = (null_count / len(values)) if values else 0
 
-        numeric_vals = [safe_float(v) for v in values]
-        numeric_vals = [v for v in numeric_vals if v is not None]
-
-        if len(values) > 0 and len(numeric_vals) >= max(2, int(len(values) * 0.5)):
+        col_type = detected_types[h]
+        if col_type in {"numeric", "percent_like"}:
             summary["numeric_columns"].append(h)
-            total = sum(numeric_vals)
-            avg = total / len(numeric_vals) if numeric_vals else None
-            min_v = min(numeric_vals) if numeric_vals else None
-            max_v = max(numeric_vals) if numeric_vals else None
-
-            sorted_vals = sorted(numeric_vals)
-            median = None
-            if sorted_vals:
-                n = len(sorted_vals)
-                if n % 2 == 1:
-                    median = sorted_vals[n // 2]
-                else:
-                    median = (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2
-
             summary["column_profiles"][h] = {
-                "type": "numeric",
-                "count": len(numeric_vals),
-                "null_count": null_count,
-                "sum": total,
-                "avg": avg,
-                "min": min_v,
-                "max": max_v,
-                "median": median,
+                "type": col_type,
+                **build_numeric_profile(h, values, analysis_rows, analysis_indexes, label_column, top_n),
             }
         else:
             summary["text_columns"].append(h)
-            freq = {}
-            for v in values:
-                if v is None:
-                    continue
-                key = str(v)
-                freq[key] = freq.get(key, 0) + 1
-
-            top_values = sorted(freq.items(), key=lambda x: (-x[1], x[0]))[:top_n]
             summary["column_profiles"][h] = {
-                "type": "text",
-                "count": len(values) - null_count,
-                "null_count": null_count,
-                "unique_count": len(freq),
-                "top_values": [{"value": k, "count": v} for k, v in top_values],
+                "type": col_type,
+                **build_text_profile(values, top_n),
             }
+
+        if summary["null_ratios"][h] >= 0.3:
+            summary["warnings"].append(f"{h} 컬럼의 결측률이 {summary['null_ratios'][h]:.0%}로 높습니다.")
+
+        if col_type in {"text", "id_like", "date_like", "month_like"}:
+            skew_warning = analyze_categorical_skew(h, summary["column_profiles"][h], len(analysis_rows))
+            if skew_warning:
+                summary["warnings"].append(skew_warning)
+
+    if total_row_indexes:
+        summary["warnings"].append(
+            f"합계행/총계행 후보 {len(total_row_indexes)}개가 감지되어 일반 분포 계산에서 제외했습니다. row_indexes={total_row_indexes}"
+        )
 
     return summary
 
@@ -337,8 +636,16 @@ def build_basic_summary_text(selection_data: dict, table: dict, summary: dict) -
     lines.append(f"[Sheet] {selection_data['sheet_name']}")
     lines.append(f"[선택 범위] {selection_data['address']}")
     lines.append(f"[행 수] {summary['row_count']}")
+    lines.append(f"[분석 대상 행 수] {summary.get('data_row_count', summary['row_count'])}")
     lines.append(f"[열 수] {summary['column_count']}")
+    lines.append(f"[표 주제 추정] {summary.get('table_topic_guess', 'general')}")
     lines.append(f"[헤더] {', '.join(summary['headers'])}")
+    if summary.get("time_columns"):
+        lines.append(f"[시간 컬럼 후보] {', '.join(summary['time_columns'])}")
+    if summary.get("total_rows_count"):
+        lines.append(
+            f"[합계행 후보] {summary['total_rows_count']}개 (indexes={summary.get('total_row_indexes', [])})"
+        )
     lines.append("-" * 80)
 
     lines.append("[숫자형 컬럼]")
@@ -349,6 +656,7 @@ def build_basic_summary_text(selection_data: dict, table: dict, summary: dict) -
             p = summary["column_profiles"][col]
             lines.append(
                 f"  - {col}: count={p['count']}, null={p['null_count']}, "
+                f"null_ratio={p.get('null_ratio', 0):.0%}, "
                 f"sum={format_number(p['sum'])}, avg={format_number(p['avg'])}, "
                 f"min={format_number(p['min'])}, max={format_number(p['max'])}"
             )
@@ -363,8 +671,14 @@ def build_basic_summary_text(selection_data: dict, table: dict, summary: dict) -
             top_vals = ", ".join(f"{x['value']}({x['count']})" for x in p["top_values"][:5])
             lines.append(
                 f"  - {col}: count={p['count']}, null={p['null_count']}, "
-                f"unique={p['unique_count']}, top={top_vals}"
+                f"null_ratio={p.get('null_ratio', 0):.0%}, unique={p['unique_count']}, top={top_vals}"
             )
+
+    if summary.get("warnings"):
+        lines.append("-" * 80)
+        lines.append("[주의 사항]")
+        for warning in summary["warnings"][:8]:
+            lines.append(f"  - {warning}")
 
     lines.append("=" * 80)
     return "\n".join(lines)
@@ -374,7 +688,14 @@ def build_basic_summary_text(selection_data: dict, table: dict, summary: dict) -
 # 6) 프롬프트
 # =========================================================
 
-def build_llm_prompt(selection_data: dict, table: dict, summary: dict, preview_rows: list, mode: str) -> str:
+def build_llm_prompt(
+    selection_data: dict,
+    table: dict,
+    summary: dict,
+    insight_summary: dict,
+    preview_rows: list,
+    mode: str,
+) -> str:
     prompt_map = {
         "summary": """
 요구사항:
@@ -402,17 +723,21 @@ def build_llm_prompt(selection_data: dict, table: dict, summary: dict, preview_r
         "workbook_name": selection_data["workbook_name"],
         "sheet_name": selection_data["sheet_name"],
         "table_range": table["table_range"],
+        "insight_summary": insight_summary,
         "summary": summary,
         "preview_rows": preview_rows,
     }
 
     safe_payload = make_json_safe(payload)
-    json.dumps(safe_payload, ensure_ascii=False, indent=2)
 
     return f"""
     다음은 현재 사용자가 Excel에서 선택한 표 영역을 읽어 요약한 데이터입니다.
     이 정보를 바탕으로 한국어로 알기 쉽게 해석해 주세요.
-    모르는 것은 추정이라고 표시하고, 없는 사실을 만들지 마세요.
+    우선순위는 1) insight_summary 2) summary 3) preview_rows 입니다.
+    모르는 것은 반드시 '추정'이라고 표시하고, 없는 사실을 만들지 마세요.
+    숫자 근거를 우선 사용하세요.
+    합계행/총계행은 일반 데이터와 구분해서 해석하세요.
+    결측률/편중/이상치가 있으면 먼저 언급하세요.
 
     {prompt_map.get(mode, prompt_map["summary"])}
 
@@ -429,6 +754,7 @@ def run_selection_analysis(mode: str) -> str:
         raise RuntimeError("선택 범위에 데이터 행이 없습니다.")
 
     summary = summarize_table(table)
+    insight_summary = build_insight_summary(summary)
     preview_rows = build_preview_rows(table, limit=8)
     basic_summary = build_basic_summary_text(selection_data, table, summary)
 
@@ -441,6 +767,7 @@ def run_selection_analysis(mode: str) -> str:
         selection_data=selection_data,
         table=table,
         summary=summary,
+        insight_summary=insight_summary,
         preview_rows=preview_rows,
         mode=mode,
     )
@@ -454,6 +781,46 @@ def run_selection_analysis(mode: str) -> str:
     llm_text = extract_llm_text(result)
 
     return f"{basic_summary}\n\n[LLM 결과]\n{llm_text}"
+
+
+def get_mock_tables() -> list[dict]:
+    return [
+        {
+            "name": "financial_monthly",
+            "headers": ["월", "매출", "원가", "이익률", "LOT_ID"],
+            "rows": [
+                {"월": "2026-01", "매출": 1200, "원가": 900, "이익률": 0.25, "LOT_ID": "LOT-001"},
+                {"월": "2026-02", "매출": 1500, "원가": 1100, "이익률": 0.27, "LOT_ID": "LOT-002"},
+                {"월": "2026-03", "매출": None, "원가": 1000, "이익률": 0.0, "LOT_ID": "LOT-003"},
+                {"월": "총계", "매출": 2700, "원가": 3000, "이익률": 0.18, "LOT_ID": "TOTAL"},
+            ],
+            "table_range": {"address": "A1:E5"},
+        },
+        {
+            "name": "quality_daily",
+            "headers": ["일자", "라인", "수율", "불량코드", "비고"],
+            "rows": [
+                {"일자": "2026/03/01", "라인": "A", "수율": 0.98, "불량코드": "D01", "비고": None},
+                {"일자": "2026/03/02", "라인": "A", "수율": 0.97, "불량코드": "D01", "비고": None},
+                {"일자": "2026/03/03", "라인": "A", "수율": 0.96, "불량코드": "D02", "비고": "점검"},
+                {"일자": "2026/03/04", "라인": "B", "수율": 0.89, "불량코드": "D01", "비고": None},
+                {"일자": "합계", "라인": None, "수율": 0.95, "불량코드": None, "비고": None},
+            ],
+            "table_range": {"address": "A1:E6"},
+        },
+    ]
+
+
+def run_mock_analysis_tests():
+    print("[Mock analysis tests]")
+    for table in get_mock_tables():
+        summary = summarize_table(table)
+        insight_summary = build_insight_summary(summary)
+        print(f"\n=== {table['name']} ===")
+        print("[summary]")
+        print(json.dumps(make_json_safe(summary), ensure_ascii=False, indent=2))
+        print("[insight_summary]")
+        print(json.dumps(make_json_safe(insight_summary), ensure_ascii=False, indent=2))
 
 
 # =========================================================
@@ -578,8 +945,11 @@ class ExcelLLMApp:
 
 
 def main():
+    if os.getenv("RUN_MOCK_TESTS") == "1" or "--mock-test" in sys.argv:
+        run_mock_analysis_tests()
+        return
     root = tk.Tk()
-    app = ExcelLLMApp(root)
+    ExcelLLMApp(root)
     root.mainloop()
 
 
