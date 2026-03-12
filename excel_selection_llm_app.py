@@ -3281,9 +3281,9 @@ class ExcelLLMApp:
     def _build_mail_left_panel(self, parent: ttk.Frame):
         self._build_mail_fetch_section(parent)
         self._build_mail_input_section(parent)
-        self._build_mail_action_section(parent)
 
     def _build_mail_right_panel(self, parent: ttk.Frame):
+        self._build_mail_action_section(parent)
         self._build_mail_result_section(parent)
 
     def _build_mail_fetch_section(self, parent: ttk.Frame):
@@ -3323,7 +3323,7 @@ class ExcelLLMApp:
         list_frame = ttk.LabelFrame(parent, text="조회된 메일 목록", padding=8)
         list_frame.pack(fill="x", pady=(0, 10))
         columns = ("date", "sender", "subject")
-        self.mail_list_tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=6)
+        self.mail_list_tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=5)
         self.mail_list_tree.heading("date", text="날짜")
         self.mail_list_tree.heading("sender", text="발신자")
         self.mail_list_tree.heading("subject", text="제목")
@@ -3367,7 +3367,7 @@ class ExcelLLMApp:
             body_frame,
             wrap="word",
             font=("Consolas", 10),
-            height=18,
+            height=12,
             spacing1=2,
             spacing3=4,
         )
@@ -3375,7 +3375,7 @@ class ExcelLLMApp:
 
     def _build_mail_action_section(self, parent: ttk.Frame):
         action_frame = ttk.LabelFrame(parent, text="분석 실행", padding=10)
-        action_frame.pack(fill="x")
+        action_frame.pack(fill="x", pady=(0, 10))
 
         top_row = ttk.Frame(action_frame)
         top_row.pack(fill="x", pady=(0, 6))
