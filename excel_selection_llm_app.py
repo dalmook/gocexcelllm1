@@ -3460,7 +3460,7 @@ class ExcelLLMApp:
         title.pack(anchor="w")
         desc = ttk.Label(
             container,
-            text="메일함 조회 또는 수동 입력 후 구조화 분석, 요약, 답장, 표현 점검, 발표용 HTML 생성을 실행하세요.",
+            text="사용 순서: 로그인 -> 메일 조회 -> 메일 선택/불러오기 -> 구조화 분석 또는 요약/답장 실행",
             font=("맑은 고딕", 10),
         )
         desc.pack(anchor="w", pady=(4, 10))
