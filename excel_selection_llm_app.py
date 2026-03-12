@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
+from tkinter import scrolledtext
 
 import requests
 try:
@@ -1651,6 +1652,103 @@ def build_llm_prompt(
     """.strip()
 
 
+def normalize_mail_text(text: str) -> str:
+    cleaned = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned
+
+
+def build_mail_summary_prompt(subject: str, body: str) -> str:
+    payload = {
+        "subject": subject.strip() if subject else "",
+        "body": normalize_mail_text(body),
+    }
+    return f"""
+다음 메일을 한국어로 간결하게 요약하세요.
+
+규칙:
+- 핵심만 간결하게 정리하세요.
+- 요청사항이 있으면 분리해서 적으세요.
+- 일정/기한 언급이 있으면 짚으세요.
+- 없는 사실을 추정하지 마세요.
+- 아래 형식을 유지하세요.
+
+[한줄 요약]
+...
+[핵심 포인트]
+1. ...
+2. ...
+3. ...
+[요청/확인 필요]
+...
+
+메일 데이터(JSON):
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+    """.strip()
+
+
+def build_mail_reply_prompt(subject: str, body: str) -> str:
+    payload = {
+        "subject": subject.strip() if subject else "",
+        "body": normalize_mail_text(body),
+    }
+    return f"""
+다음 메일에 대한 한국어 업무 메일 답장 초안을 작성하세요.
+
+규칙:
+- 정중한 한국어 업무 메일 톤을 유지하세요.
+- 지나치게 장황하지 않게 작성하세요.
+- 원문에 없는 사실을 추가하지 마세요.
+- 원문 근거 없는 확답은 금지합니다.
+- 불확실한 내용은 '확인 후 회신드리겠습니다'처럼 중립적으로 표현하세요.
+- 요청 수락/보류/확인 중 모두 가능한 중립적 표현을 허용합니다.
+- 아래 형식을 유지하세요.
+
+[답장 초안]
+안녕하세요...
+
+메일 데이터(JSON):
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+    """.strip()
+
+
+def analyze_mail_summary(subject: str, body: str) -> str:
+    normalized_body = normalize_mail_text(body)
+    if not normalized_body:
+        raise RuntimeError("메일 본문이 비어 있습니다.")
+
+    system_prompt = (
+        "당신은 한국어 업무 메일을 빠르게 읽고 핵심만 정리해주는 비서입니다. "
+        "없는 사실은 만들지 말고, 요청사항과 일정이 있으면 분리해서 적으세요."
+    )
+    result = call_gpt_oss(
+        prompt=build_mail_summary_prompt(subject, normalized_body),
+        system_prompt=system_prompt,
+        temperature=0.2,
+        max_tokens=1200,
+    )
+    return "===== 메일 핵심 요약 =====\n" + extract_llm_text(result)
+
+
+def analyze_mail_reply(subject: str, body: str) -> str:
+    normalized_body = normalize_mail_text(body)
+    if not normalized_body:
+        raise RuntimeError("메일 본문이 비어 있습니다.")
+
+    system_prompt = (
+        "당신은 한국어 업무 메일 답장 초안을 작성하는 비서입니다. "
+        "정중하고 간결하게 쓰되, 근거 없는 확답과 사실 추가는 금지합니다."
+    )
+    result = call_gpt_oss(
+        prompt=build_mail_reply_prompt(subject, normalized_body),
+        system_prompt=system_prompt,
+        temperature=0.2,
+        max_tokens=1200,
+    )
+    return "===== 자동 답장문구 =====\n" + extract_llm_text(result)
+
+
 def analyze_selection_data(selection_data: dict, mode: str, config: AnalysisConfig | None = None) -> dict:
     config = config or get_default_analysis_config()
     table = selection_to_table(selection_data, config=config)
@@ -1854,6 +1952,46 @@ def run_mock_config_tests():
         print(json.dumps(make_json_safe(summary.get("table_main_points")), ensure_ascii=False, indent=2))
 
 
+MAIL_SAMPLE_CASES = [
+    {
+        "name": "deadline_request",
+        "subject": "3월 운영 계획 검토 요청",
+        "body": """
+안녕하세요.
+
+첨부드린 3월 운영 계획안 검토 부탁드립니다.
+가능하시면 3월 15일(금) 오전까지 의견 회신 부탁드리며,
+특히 인력 배치와 예산 항목 중심으로 확인해주시면 됩니다.
+
+추가 확인이 필요한 부분이 있으면 알려주세요.
+감사합니다.
+        """,
+    },
+    {
+        "name": "meeting_followup",
+        "subject": "",
+        "body": """
+금일 회의 내용 정리드립니다.
+
+1. 샘플 출하는 다음 주 초 목표로 진행
+2. 고객 요청사항은 내부 검토 후 회신 예정
+3. 일정 변경 가능성이 있어 금요일에 다시 공유 필요
+
+확인 부탁드립니다.
+        """,
+    },
+]
+
+
+def test_mail_prompts():
+    print("[Mail prompt tests]")
+    for case in MAIL_SAMPLE_CASES:
+        print(f"\n=== {case['name']} / summary ===")
+        print(build_mail_summary_prompt(case["subject"], case["body"]))
+        print(f"\n=== {case['name']} / reply ===")
+        print(build_mail_reply_prompt(case["subject"], case["body"]))
+
+
 # =========================================================
 # 7) Tkinter UI
 # =========================================================
@@ -1861,10 +1999,11 @@ def run_mock_config_tests():
 class ExcelLLMApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Excel 선택영역 LLM 요약기")
+        self.root.title("Excel / 메일 LLM 분석기")
         self.root.geometry("1280x900")
 
-        self.status_var = tk.StringVar(value="준비됨")
+        self.excel_status_var = tk.StringVar(value="준비됨")
+        self.mail_status_var = tk.StringVar(value="준비됨")
         self.mode_var = tk.StringVar(value="summary")
         self.selection_info_var = tk.StringVar(value="선택영역을 아직 불러오지 않았습니다.")
         self.headers_var = tk.StringVar(value="-")
@@ -1887,7 +2026,19 @@ class ExcelLLMApp:
         self._build_ui()
 
     def _build_ui(self):
-        top = ttk.Frame(self.root, padding=12)
+        notebook = ttk.Notebook(self.root)
+        notebook.pack(fill="both", expand=True)
+
+        self.excel_tab = ttk.Frame(notebook)
+        self.mail_tab = ttk.Frame(notebook)
+        notebook.add(self.excel_tab, text="Excel 분석")
+        notebook.add(self.mail_tab, text="메일 분석")
+
+        self._build_excel_tab(self.excel_tab)
+        self._build_mail_tab(self.mail_tab)
+
+    def _build_excel_tab(self, parent: ttk.Frame):
+        top = ttk.Frame(parent, padding=12)
         top.pack(fill="x")
 
         title = ttk.Label(top, text="현재 Excel 선택영역 요약 / 해석", font=("맑은 고딕", 15, "bold"))
@@ -1929,14 +2080,14 @@ class ExcelLLMApp:
         status_frame.pack(fill="x", pady=(0, 10))
 
         ttk.Label(status_frame, text="상태:", font=("맑은 고딕", 10, "bold")).pack(side="left")
-        ttk.Label(status_frame, textvariable=self.status_var).pack(side="left", padx=(6, 0))
+        ttk.Label(status_frame, textvariable=self.excel_status_var).pack(side="left", padx=(6, 0))
 
-        self._build_config_panel()
-        self._build_preview_panel()
-        self._build_result_panel()
+        self._build_config_panel(parent)
+        self._build_preview_panel(parent)
+        self._build_result_panel(parent)
 
-    def _build_config_panel(self):
-        config_frame = ttk.LabelFrame(self.root, text="분석 설정", padding=12)
+    def _build_config_panel(self, parent: ttk.Frame):
+        config_frame = ttk.LabelFrame(parent, text="분석 설정", padding=12)
         config_frame.pack(fill="x", padx=12, pady=(0, 10))
 
         info_frame = ttk.Frame(config_frame)
@@ -1992,8 +2143,8 @@ class ExcelLLMApp:
         self.merge_text.pack(fill="x")
         self.merge_text.configure(state="disabled")
 
-    def _build_preview_panel(self):
-        preview_frame = ttk.LabelFrame(self.root, text="선택영역 미리보기", padding=12)
+    def _build_preview_panel(self, parent: ttk.Frame):
+        preview_frame = ttk.LabelFrame(parent, text="선택영역 미리보기", padding=12)
         preview_frame.pack(fill="both", expand=False, padx=12, pady=(0, 10))
 
         self.preview_tree = ttk.Treeview(preview_frame, show="headings", height=8)
@@ -2002,8 +2153,8 @@ class ExcelLLMApp:
         preview_scroll.pack(side="right", fill="y")
         self.preview_tree.configure(yscrollcommand=preview_scroll.set)
 
-    def _build_result_panel(self):
-        result_frame = ttk.Frame(self.root, padding=(12, 0, 12, 12))
+    def _build_result_panel(self, parent: ttk.Frame):
+        result_frame = ttk.Frame(parent, padding=(12, 0, 12, 12))
         result_frame.pack(fill="both", expand=True)
 
         self.txt = tk.Text(result_frame, wrap="word", font=("Consolas", 10))
@@ -2012,6 +2163,52 @@ class ExcelLLMApp:
         scroll = ttk.Scrollbar(result_frame, orient="vertical", command=self.txt.yview)
         scroll.pack(side="right", fill="y")
         self.txt.configure(yscrollcommand=scroll.set)
+
+    def _build_mail_tab(self, parent: ttk.Frame):
+        top = ttk.Frame(parent, padding=12)
+        top.pack(fill="both", expand=True)
+
+        title = ttk.Label(top, text="메일 분석", font=("맑은 고딕", 15, "bold"))
+        title.pack(anchor="w")
+
+        desc = ttk.Label(
+            top,
+            text="메일 제목과 본문을 붙여넣은 뒤 핵심 요약 또는 답장문구 생성을 실행하세요.",
+            font=("맑은 고딕", 10),
+        )
+        desc.pack(anchor="w", pady=(4, 10))
+
+        subject_frame = ttk.Frame(top)
+        subject_frame.pack(fill="x", pady=(0, 8))
+        ttk.Label(subject_frame, text="메일 제목", width=12).pack(side="left")
+        self.mail_subject_entry = ttk.Entry(subject_frame)
+        self.mail_subject_entry.pack(side="left", fill="x", expand=True)
+
+        body_frame = ttk.LabelFrame(top, text="메일 본문", padding=8)
+        body_frame.pack(fill="both", expand=True, pady=(0, 10))
+        self.mail_body_text = scrolledtext.ScrolledText(body_frame, wrap="word", font=("Consolas", 10), height=14)
+        self.mail_body_text.pack(fill="both", expand=True)
+
+        btn_frame = ttk.Frame(top)
+        btn_frame.pack(fill="x", pady=(0, 10))
+        self.mail_btn_summary = ttk.Button(btn_frame, text="핵심 요약", command=self.on_mail_summary)
+        self.mail_btn_summary.pack(side="left", padx=(0, 8))
+        self.mail_btn_reply = ttk.Button(btn_frame, text="답장문구 생성", command=self.on_mail_reply)
+        self.mail_btn_reply.pack(side="left", padx=(0, 8))
+        self.mail_btn_clear = ttk.Button(btn_frame, text="입력 지우기", command=self.on_mail_clear)
+        self.mail_btn_clear.pack(side="left", padx=(0, 8))
+        self.mail_btn_copy = ttk.Button(btn_frame, text="결과 복사", command=self.on_mail_copy)
+        self.mail_btn_copy.pack(side="left", padx=(0, 8))
+
+        status_frame = ttk.Frame(top)
+        status_frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(status_frame, text="상태:", font=("맑은 고딕", 10, "bold")).pack(side="left")
+        ttk.Label(status_frame, textvariable=self.mail_status_var).pack(side="left", padx=(6, 0))
+
+        result_frame = ttk.LabelFrame(top, text="분석 결과", padding=8)
+        result_frame.pack(fill="both", expand=True)
+        self.mail_result_text = scrolledtext.ScrolledText(result_frame, wrap="word", font=("Consolas", 10), height=14)
+        self.mail_result_text.pack(fill="both", expand=True)
 
     def _render_metric_checkboxes(self, metrics: list[str], default_selected: list[str]):
         for checkbutton in self.metric_checkbuttons:
@@ -2128,13 +2325,22 @@ class ExcelLLMApp:
             self.set_status("오류 발생")
 
     def set_status(self, text: str):
-        self.status_var.set(text)
+        self.excel_status_var.set(text)
         self.root.update_idletasks()
 
     def append_text(self, text: str):
         self.txt.delete("1.0", "end")
         self.txt.insert("1.0", text)
         self.txt.see("1.0")
+
+    def set_mail_status(self, text: str):
+        self.mail_status_var.set(text)
+        self.root.update_idletasks()
+
+    def append_mail_result(self, text: str):
+        self.mail_result_text.delete("1.0", "end")
+        self.mail_result_text.insert("1.0", text)
+        self.mail_result_text.see("1.0")
 
     def on_run(self):
         if not self.selection_data:
@@ -2159,6 +2365,59 @@ class ExcelLLMApp:
                 self.root.after(0, lambda: self.btn_run.config(state="normal"))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _get_mail_inputs(self) -> tuple[str, str]:
+        subject = self.mail_subject_entry.get().strip()
+        body = normalize_mail_text(self.mail_body_text.get("1.0", "end"))
+        if not body:
+            messagebox.showwarning("입력 필요", "메일 본문을 입력하세요.")
+            raise RuntimeError("메일 본문이 비어 있습니다.")
+        return subject, body
+
+    def _run_mail_action(self, action_name: str, analyzer):
+        try:
+            subject, body = self._get_mail_inputs()
+        except RuntimeError:
+            return
+
+        self.mail_btn_summary.config(state="disabled")
+        self.mail_btn_reply.config(state="disabled")
+        self.set_mail_status(action_name)
+
+        def worker():
+            try:
+                result_text = analyzer(subject, body)
+                self.root.after(0, lambda: self.append_mail_result(result_text))
+                self.root.after(0, lambda: self.set_mail_status("완료"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("오류", str(e)))
+                self.root.after(0, lambda: self.set_mail_status("오류 발생"))
+            finally:
+                self.root.after(0, lambda: self.mail_btn_summary.config(state="normal"))
+                self.root.after(0, lambda: self.mail_btn_reply.config(state="normal"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_mail_summary(self):
+        self._run_mail_action("요약 생성 중...", analyze_mail_summary)
+
+    def on_mail_reply(self):
+        self._run_mail_action("답장문구 생성 중...", analyze_mail_reply)
+
+    def on_mail_clear(self):
+        self.mail_subject_entry.delete(0, "end")
+        self.mail_body_text.delete("1.0", "end")
+        self.mail_result_text.delete("1.0", "end")
+        self.set_mail_status("준비됨")
+
+    def on_mail_copy(self):
+        content = self.mail_result_text.get("1.0", "end").strip()
+        if not content:
+            messagebox.showinfo("안내", "복사할 결과가 없습니다.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(content)
+        self.set_mail_status("결과를 클립보드에 복사했습니다.")
 
     def on_copy(self):
         content = self.txt.get("1.0", "end").strip()
@@ -2194,6 +2453,9 @@ def main():
         return
     if os.getenv("RUN_MOCK_CONFIG_TESTS") == "1" or "--mock-config-test" in sys.argv:
         run_mock_config_tests()
+        return
+    if os.getenv("RUN_MAIL_PROMPT_TESTS") == "1" or "--mail-prompt-test" in sys.argv:
+        test_mail_prompts()
         return
     root = tk.Tk()
     ExcelLLMApp(root)
