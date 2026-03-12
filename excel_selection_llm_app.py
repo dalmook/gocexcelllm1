@@ -1709,6 +1709,71 @@ REPLY_STYLE_GUIDES = {
     "보류형": "즉답이 어렵고 추가 확인이 필요하다는 방향을 분명히 하세요.",
 }
 
+REPLY_GREETING_MODES = {
+    "자동": "기본값입니다. 수신자 이름, 직급, 호칭을 생략하고 일반형 인사말만 사용합니다.",
+    "원문존중": "원문 제목/본문/선택 메타데이터에 명확히 있는 호칭 후보가 있을 때만 제한적으로 사용합니다.",
+}
+
+HONORIFIC_TOKEN_PATTERN = re.compile(
+    r"([가-힣A-Za-z]{2,20}(?:님|팀장님|책임님|프로님|매니저님|선임님|수석님|박사님|차장님|부장님|과장님|대리님))"
+)
+
+
+def extract_explicit_addressee_candidates(subject: str, body: str, mail_meta: dict | None = None) -> list[str]:
+    candidates = []
+    source_texts = [subject or "", body or ""]
+    if mail_meta:
+        source_texts.extend([mail_meta.get("sender", ""), mail_meta.get("subject", "")])
+    for source in source_texts:
+        if not source:
+            continue
+        candidates.extend(match.group(1).strip() for match in HONORIFIC_TOKEN_PATTERN.finditer(source))
+    return dedupe_preserve_order([item for item in candidates if item])[:10]
+
+
+def enforce_safe_reply_greeting(
+    reply_text: str,
+    greeting_mode: str = "자동",
+    allowed_addressees: list[str] | None = None,
+) -> str:
+    allowed_addressees = allowed_addressees or []
+    lines = sanitize_markdown_for_tk(reply_text).splitlines()
+    body_started = False
+    body_index = None
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("=") or (stripped.startswith("[") and stripped.endswith("]")):
+            continue
+        body_started = True
+        body_index = idx
+        break
+
+    if body_started and body_index is not None:
+        first_line = lines[body_index].strip()
+        generic_greeting = "안녕하세요."
+        if greeting_mode != "원문존중" or not allowed_addressees:
+            if first_line != generic_greeting:
+                lines[body_index] = generic_greeting
+        else:
+            has_allowed = any(token in first_line for token in allowed_addressees)
+            has_honorific = bool(HONORIFIC_TOKEN_PATTERN.search(first_line))
+            if has_honorific and not has_allowed:
+                lines[body_index] = generic_greeting
+
+    if greeting_mode != "원문존중" or not allowed_addressees:
+        filtered = []
+        for line in lines:
+            stripped = line.strip()
+            if HONORIFIC_TOKEN_PATTERN.search(stripped) and ("안녕하세요" in stripped or "귀하" in stripped):
+                filtered.append("안녕하세요.")
+            else:
+                filtered.append(line)
+        lines = filtered
+
+    return normalize_mail_text("\n".join(lines))
+
 
 def decode_mime_header(value: str | None) -> str:
     if not value:
@@ -2143,20 +2208,37 @@ def build_mail_summary_prompt(subject: str, body: str, structured_info: dict | N
     """.strip()
 
 
-def build_mail_reply_prompt(subject: str, body: str, structured_info: dict | None = None, reply_style: str = "정중형") -> str:
+def build_mail_reply_prompt(
+    subject: str,
+    body: str,
+    structured_info: dict | None = None,
+    reply_style: str = "정중형",
+    greeting_mode: str = "자동",
+    mail_meta: dict | None = None,
+) -> str:
+    allowed_addressees = extract_explicit_addressee_candidates(subject, body, mail_meta=mail_meta)
     payload = {
         "subject": subject.strip() if subject else "",
         "body": normalize_mail_text(body),
         "structured_info": structured_info or {},
         "reply_style": reply_style,
+        "greeting_mode": greeting_mode,
+        "allowed_addressees": allowed_addressees,
+        "mail_meta": mail_meta or {},
     }
     style_guide = REPLY_STYLE_GUIDES.get(reply_style, REPLY_STYLE_GUIDES["정중형"])
+    greeting_guide = REPLY_GREETING_MODES.get(greeting_mode, REPLY_GREETING_MODES["자동"])
     return f"""
 다음 메일에 대한 한국어 업무 메일 답장 초안을 작성하세요.
 
 규칙:
 - 답장 스타일: {reply_style}
 - {style_guide}
+- 인사말 모드: {greeting_mode}
+- {greeting_guide}
+- 수신자 이름, 직급, 호칭(예: 팀장님, 책임님, 프로님, 매니저님)을 추측해서 쓰지 마세요.
+- 제목/본문/선택 메타데이터에 명확히 있는 경우에만 수신 호칭을 사용할 수 있습니다.
+- allowed_addressees가 비어 있으면 반드시 '안녕하세요.' 또는 '안녕하세요, 메일 잘 받았습니다.'처럼 일반형으로 시작하세요.
 - 지나치게 장황하지 않게 작성하세요.
 - 원문에 없는 사실을 추가하지 마세요.
 - 원문 근거 없는 확답은 금지합니다.
@@ -2254,7 +2336,14 @@ def summarize_mail_content(subject: str, body: str, structured_info: dict | None
     return sanitize_markdown_for_tk(extract_llm_text(result))
 
 
-def generate_mail_reply(subject: str, body: str, structured_info: dict | None = None, reply_style: str = "정중형") -> str:
+def generate_mail_reply(
+    subject: str,
+    body: str,
+    structured_info: dict | None = None,
+    reply_style: str = "정중형",
+    greeting_mode: str = "자동",
+    mail_meta: dict | None = None,
+) -> str:
     normalized_body = normalize_mail_text(body)
     if not normalized_body:
         raise RuntimeError("메일 본문이 비어 있습니다.")
@@ -2264,12 +2353,25 @@ def generate_mail_reply(subject: str, body: str, structured_info: dict | None = 
         "정중하고 간결하게 쓰되, 근거 없는 확답과 사실 추가는 금지합니다."
     )
     result = call_gpt_oss(
-        prompt=build_mail_reply_prompt(subject, normalized_body, structured_info=structured_info, reply_style=reply_style),
+        prompt=build_mail_reply_prompt(
+            subject,
+            normalized_body,
+            structured_info=structured_info,
+            reply_style=reply_style,
+            greeting_mode=greeting_mode,
+            mail_meta=mail_meta,
+        ),
         system_prompt=system_prompt,
         temperature=0.2,
         max_tokens=1200,
     )
-    return sanitize_markdown_for_tk(extract_llm_text(result))
+    safe_text = sanitize_markdown_for_tk(extract_llm_text(result))
+    allowed_addressees = extract_explicit_addressee_candidates(subject, normalized_body, mail_meta=mail_meta)
+    return enforce_safe_reply_greeting(
+        safe_text,
+        greeting_mode=greeting_mode,
+        allowed_addressees=allowed_addressees,
+    )
 
 
 def inspect_mail_expression(subject: str, body: str, structured_info: dict | None = None) -> dict:
@@ -2617,6 +2719,8 @@ def run_mail_analysis(
     summary_text: str | None = None,
     inspection_info: dict | None = None,
     reply_style: str = "정중형",
+    greeting_mode: str = "자동",
+    mail_meta: dict | None = None,
 ) -> dict:
     normalized_body = normalize_mail_text(body)
     if not normalized_body:
@@ -2637,7 +2741,14 @@ def run_mail_analysis(
             "result_text": summary_text,
         }
     if mode == "reply":
-        reply_text = generate_mail_reply(subject, normalized_body, structured_info=structured_info, reply_style=reply_style)
+        reply_text = generate_mail_reply(
+            subject,
+            normalized_body,
+            structured_info=structured_info,
+            reply_style=reply_style,
+            greeting_mode=greeting_mode,
+            mail_meta=mail_meta,
+        )
         return {
             "mode": mode,
             "structured_info": structured_info,
@@ -3130,6 +3241,7 @@ class ExcelLLMApp:
         self.mail_result_type_var = tk.StringVar(value="현재 결과: 없음")
         self.mail_result_meta_var = tk.StringVar(value="메일 메타: 없음")
         self.mail_reply_style_var = tk.StringVar(value="정중형")
+        self.mail_greeting_mode_var = tk.StringVar(value="자동")
 
         self.selection_data: dict | None = None
         self.auto_summary: dict | None = None
@@ -3407,6 +3519,15 @@ class ExcelLLMApp:
             values=list(REPLY_STYLE_GUIDES.keys()),
         )
         self.mail_reply_style_combo.pack(side="left")
+        ttk.Label(option_frame, text="인사말 모드", width=10).pack(side="left", padx=(14, 0))
+        self.mail_greeting_mode_combo = ttk.Combobox(
+            option_frame,
+            textvariable=self.mail_greeting_mode_var,
+            state="readonly",
+            width=10,
+            values=list(REPLY_GREETING_MODES.keys()),
+        )
+        self.mail_greeting_mode_combo.pack(side="left")
 
         body_frame = ttk.LabelFrame(input_frame, text="메일 본문", padding=6)
         body_frame.pack(fill="both", expand=True)
@@ -3788,6 +3909,7 @@ class ExcelLLMApp:
         self.set_mail_status(action_name)
         mail_meta = self.current_mail_meta or self._build_current_mail_meta(subject)
         reply_style = self.mail_reply_style_var.get().strip() or "정중형"
+        greeting_mode = self.mail_greeting_mode_var.get().strip() or "자동"
 
         def worker():
             try:
@@ -3798,6 +3920,8 @@ class ExcelLLMApp:
                     structured_info=self.mail_structured_info,
                     inspection_info=self.mail_inspection_info,
                     reply_style=reply_style,
+                    greeting_mode=greeting_mode,
+                    mail_meta=mail_meta,
                 )
                 self.mail_structured_info = analysis_result.get("structured_info")
                 self.mail_inspection_info = analysis_result.get("inspection_info", self.mail_inspection_info)
