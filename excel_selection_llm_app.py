@@ -8,6 +8,7 @@ import uuid
 import math
 import difflib
 from datetime import datetime, date
+from dataclasses import dataclass, field
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -169,6 +170,20 @@ def format_number(x, digits: int = 2) -> str:
     if abs(x - int(x)) < 1e-9:
         return f"{int(x):,}"
     return f"{x:,.{digits}f}"
+
+
+@dataclass
+class AnalysisConfig:
+    selected_label_column: str | None = None
+    selected_time_column: str | None = None
+    selected_metric_columns: list[str] = field(default_factory=list)
+    exclude_total_rows: bool = True
+    apply_merge_candidates: bool = False
+    use_first_row_as_header: bool = True
+
+
+def get_default_analysis_config() -> AnalysisConfig:
+    return AnalysisConfig()
 
 
 MONTH_TOKEN_PATTERN = re.compile(
@@ -847,6 +862,94 @@ def dedupe_typo_candidates(candidates: list[dict]) -> list[dict]:
     return result
 
 
+def copy_rows(rows: list[dict]) -> list[dict]:
+    return [dict(row) for row in rows]
+
+
+def apply_merge_candidates_to_rows(
+    rows: list[dict],
+    typo_candidates: list[dict],
+    merge_candidates: list[dict],
+    enabled: bool,
+) -> list[dict]:
+    if not enabled:
+        return copy_rows(rows)
+
+    canonical_map = {}
+    for candidate in typo_candidates:
+        column = candidate.get("column")
+        canonical = candidate.get("canonical_candidate")
+        if not column or canonical is None:
+            continue
+        for value in candidate.get("similar_values", []):
+            canonical_map[(column, value)] = canonical
+
+    for candidate in merge_candidates:
+        column = candidate.get("column")
+        canonical = candidate.get("canonical_candidate")
+        if not column or canonical is None:
+            continue
+        for value in candidate.get("merge_values", []):
+            if value != canonical:
+                canonical_map[(column, value)] = canonical
+
+    merged_rows = []
+    for row in rows:
+        new_row = dict(row)
+        for (column, value), canonical in canonical_map.items():
+            if new_row.get(column) == value:
+                new_row[column] = canonical
+        merged_rows.append(new_row)
+    return merged_rows
+
+
+def build_analysis_candidates(table: dict) -> dict:
+    summary = summarize_table(table, config=get_default_analysis_config())
+    detected_types = summary.get("detected_column_types", {})
+    headers = table.get("headers", [])
+    label_candidates = ["자동 추론 사용"]
+    for header in headers:
+        col_type = detected_types.get(header)
+        if col_type in {"text", "date_like", "month_like"}:
+            label_candidates.append(header)
+        elif col_type == "id_like":
+            label_candidates.append(f"{header} (ID-like)")
+
+    time_candidates = ["자동 추론 사용", "없음"]
+    for column in summary.get("time_columns", []):
+        if column not in time_candidates:
+            time_candidates.append(column)
+
+    metric_candidates = summary.get("numeric_columns", [])
+
+    return {
+        "summary": summary,
+        "label_candidates": label_candidates,
+        "time_candidates": time_candidates,
+        "metric_candidates": metric_candidates,
+        "merge_preview": summary.get("typo_candidates", []) + summary.get("merge_candidates", []),
+    }
+
+
+def normalize_config_value(value: str | None) -> str | None:
+    if value in (None, "", "자동 추론 사용", "없음"):
+        return None
+    return re.sub(r"\s+\(ID-like\)$", "", value)
+
+
+def build_analysis_config_summary(config: AnalysisConfig, summary: dict) -> dict:
+    return {
+        "selected_label_column": config.selected_label_column or summary.get("label_column"),
+        "selected_time_column": normalize_config_value(config.selected_time_column) if config.selected_time_column is not None else (
+            summary.get("time_columns", [None])[0] if summary.get("time_columns") else None
+        ),
+        "selected_metric_columns": config.selected_metric_columns or summary.get("numeric_columns", []),
+        "exclude_total_rows": config.exclude_total_rows,
+        "apply_merge_candidates": config.apply_merge_candidates,
+        "use_first_row_as_header": config.use_first_row_as_header,
+    }
+
+
 def parse_time_value(value):
     if value is None:
         return None
@@ -1103,48 +1206,79 @@ def get_current_excel_selection() -> dict:
         else:
             values = [list(row) for row in values]
 
-        headers_raw = values[0]
-        headers = []
-        used = {}
+        normalized_values = []
+        for raw_row in values:
+            normalized_values.append([normalize_cell_value(cell_value) for cell_value in raw_row])
 
-        for i, h in enumerate(headers_raw, start=1):
-            name = clean_header_name(normalize_cell_value(h), i)
-            if name in used:
-                used[name] += 1
-                name = f"{name}_{used[name]}"
-            else:
-                used[name] = 1
-            headers.append(name)
-
-        rows = []
-        for raw_row in values[1:]:
-            item = {}
-            has_any = False
-            for idx, cell_value in enumerate(raw_row):
-                v = normalize_cell_value(cell_value)
-                item[headers[idx]] = v
-                if v is not None:
-                    has_any = True
-            if has_any:
-                rows.append(item)
+        default_table = selection_to_table(
+            {
+                "headers": [],
+                "rows": [],
+                "raw_values": normalized_values,
+                "address": sel.Address,
+            },
+            config=get_default_analysis_config(),
+        )
 
         return {
             "workbook_name": wb.Name,
             "sheet_name": ws.Name,
             "address": sel.Address,
-            "headers": headers,
-            "rows": rows,
+            "headers": default_table["headers"],
+            "rows": default_table["rows"],
+            "raw_values": normalized_values,
         }
     finally:
         pythoncom.CoUninitialize()
 
-def selection_to_table(selection_data: dict) -> dict:
-    return {
-        "headers": selection_data["headers"],
-        "rows": selection_data["rows"],
-        "table_range": {
-            "address": selection_data["address"]
+def build_headers_from_raw_row(header_row: list) -> list[str]:
+    headers = []
+    used = {}
+    for idx, value in enumerate(header_row, start=1):
+        name = clean_header_name(value, idx)
+        if name in used:
+            used[name] += 1
+            name = f"{name}_{used[name]}"
+        else:
+            used[name] = 1
+        headers.append(name)
+    return headers
+
+
+def selection_to_table(selection_data: dict, config: AnalysisConfig | None = None) -> dict:
+    config = config or get_default_analysis_config()
+    raw_values = selection_data.get("raw_values") or []
+    if not raw_values:
+        return {
+            "headers": selection_data.get("headers", []),
+            "rows": selection_data.get("rows", []),
+            "table_range": {"address": selection_data["address"]},
         }
+
+    if config.use_first_row_as_header:
+        headers = build_headers_from_raw_row(raw_values[0])
+        data_rows_raw = raw_values[1:]
+    else:
+        col_count = max(len(row) for row in raw_values) if raw_values else 0
+        headers = [f"COL_{idx}" for idx in range(1, col_count + 1)]
+        data_rows_raw = raw_values
+
+    rows = []
+    for raw_row in data_rows_raw:
+        item = {}
+        has_any = False
+        for idx, header in enumerate(headers):
+            value = raw_row[idx] if idx < len(raw_row) else None
+            item[header] = value
+            if value is not None:
+                has_any = True
+        if has_any:
+            rows.append(item)
+
+    return {
+        "headers": headers,
+        "rows": rows,
+        "table_range": {"address": selection_data["address"]},
     }
 
 
@@ -1152,12 +1286,17 @@ def selection_to_table(selection_data: dict) -> dict:
 # 5) 표 요약
 # =========================================================
 
-def summarize_table(table: dict, top_n: int = 5) -> dict:
+def summarize_table(table: dict, top_n: int = 5, config: AnalysisConfig | None = None) -> dict:
+    config = config or get_default_analysis_config()
     headers = table["headers"]
     rows = table["rows"]
     total_row_indexes = detect_total_row_indexes(rows, headers)
-    data_rows = [row for idx, row in enumerate(rows) if idx not in total_row_indexes]
-    data_indexes = [idx for idx in range(len(rows)) if idx not in total_row_indexes]
+    if config.exclude_total_rows:
+        data_rows = [row for idx, row in enumerate(rows) if idx not in total_row_indexes]
+        data_indexes = [idx for idx in range(len(rows)) if idx not in total_row_indexes]
+    else:
+        data_rows = list(rows)
+        data_indexes = list(range(len(rows)))
     total_rows = [row for idx, row in enumerate(rows) if idx in total_row_indexes]
     table_topic_guess = guess_table_topic(headers)
     thresholds = get_analysis_thresholds()
@@ -1179,6 +1318,9 @@ def summarize_table(table: dict, top_n: int = 5) -> dict:
         "total_row_indexes": total_row_indexes,
         "table_topic_guess": table_topic_guess,
         "label_column": None,
+        "applied_time_column": None,
+        "applied_metric_columns": [],
+        "analysis_config": {},
         "major_metrics": [],
         "category_shares": [],
         "top_performers": [],
@@ -1214,7 +1356,7 @@ def summarize_table(table: dict, top_n: int = 5) -> dict:
         detected_types[h] = infer_column_type(h, col_values[h], len(analysis_rows))
     summary["detected_column_types"] = detected_types
     summary["time_columns"] = [h for h, col_type in detected_types.items() if col_type in {"date_like", "month_like"}]
-    label_column = choose_label_column(headers, analysis_rows, detected_types)
+    label_column = normalize_config_value(config.selected_label_column) or choose_label_column(headers, analysis_rows, detected_types)
     summary["label_column"] = label_column
 
     for h in headers:
@@ -1244,6 +1386,21 @@ def summarize_table(table: dict, top_n: int = 5) -> dict:
             skew_warning = analyze_categorical_skew(h, summary["column_profiles"][h], len(analysis_rows))
             if skew_warning:
                 summary["warnings"].append(skew_warning)
+
+    summary["time_columns"] = (
+        [normalize_config_value(config.selected_time_column)]
+        if normalize_config_value(config.selected_time_column)
+        else summary["time_columns"]
+    )
+    summary["applied_time_column"] = summary["time_columns"][0] if summary["time_columns"] else None
+    if config.selected_time_column == "없음":
+        summary["time_columns"] = []
+        summary["applied_time_column"] = None
+
+    if config.selected_metric_columns:
+        selected_metrics = [column for column in config.selected_metric_columns if column in summary["numeric_columns"]]
+        summary["numeric_columns"] = selected_metrics
+    summary["applied_metric_columns"] = list(summary["numeric_columns"])
 
     summary["major_metrics"] = build_major_metrics(summary["numeric_columns"], summary["column_profiles"])
     for metric in summary["major_metrics"]:
@@ -1276,12 +1433,30 @@ def summarize_table(table: dict, top_n: int = 5) -> dict:
     summary["typo_warnings"] = typo_warnings
     summary["label_consistency_warnings"] = consistency_warnings
 
+    effective_rows = apply_merge_candidates_to_rows(
+        analysis_rows,
+        summary["typo_candidates"],
+        summary["merge_candidates"],
+        config.apply_merge_candidates,
+    )
+    if config.apply_merge_candidates:
+        category_shares, top_performers, bottom_performers, category_warnings = build_category_analyses(
+            category_columns=category_columns,
+            numeric_columns=summary["numeric_columns"],
+            rows=effective_rows,
+            top_n=top_n,
+        )
+        summary["category_shares"] = category_shares
+        summary["top_performers"] = top_performers
+        summary["bottom_performers"] = bottom_performers
+        summary["warnings"].extend(category_warnings)
+
     summary["total_row_metrics"], summary["detected_totals"] = build_total_row_metrics(
         total_rows=total_rows,
         numeric_columns=summary["numeric_columns"],
         label_column=label_column,
     )
-    summary["trend_analysis"] = build_trend_analysis(summary, analysis_rows, headers)
+    summary["trend_analysis"] = build_trend_analysis(summary, effective_rows, headers)
     summary["top_metrics"] = build_top_metrics(summary, top_n=3)
     summary["top_categories"] = build_top_categories(summary, top_n=3)
     summary["anomaly_summary"] = build_anomaly_summary(summary)
@@ -1294,6 +1469,7 @@ def summarize_table(table: dict, top_n: int = 5) -> dict:
     summary["warnings"] = dedupe_preserve_order(summary["warnings"])
     summary["data_quality_notes"] = build_data_quality_notes(summary)
     summary["table_main_points"] = build_table_main_points(summary)
+    summary["analysis_config"] = build_analysis_config_summary(config, summary)
     summary["kpi_brief"] = build_kpi_brief(summary)
     return summary
 
@@ -1311,6 +1487,12 @@ def build_basic_summary_text(selection_data: dict, table: dict, summary: dict) -
     lines.append(f"[행 수] {summary['row_count']}")
     lines.append(f"[분석 대상 행 수] {summary.get('data_row_count', summary['row_count'])}")
     lines.append(f"[열 수] {summary['column_count']}")
+    applied_config = summary.get("analysis_config", {})
+    lines.append(f"[적용 label column] {applied_config.get('selected_label_column') or '-'}")
+    lines.append(f"[적용 time column] {applied_config.get('selected_time_column') or '-'}")
+    lines.append(f"[적용 metric columns] {', '.join(applied_config.get('selected_metric_columns', [])) or '-'}")
+    lines.append(f"[합계행 제외] {'ON' if applied_config.get('exclude_total_rows', True) else 'OFF'}")
+    lines.append(f"[merge 후보 반영] {'ON' if applied_config.get('apply_merge_candidates') else 'OFF'}")
     lines.append(f"[표 주제 추정] {summary.get('table_topic_guess', 'general')}")
     lines.append(f"[헤더] {', '.join(summary['headers'])}")
     if summary.get("label_column"):
@@ -1427,6 +1609,7 @@ def build_llm_prompt(
         "workbook_name": selection_data["workbook_name"],
         "sheet_name": selection_data["sheet_name"],
         "table_range": table["table_range"],
+        "analysis_config": summary.get("analysis_config", {}),
         "table_main_points": summary.get("table_main_points", []),
         "kpi_brief": summary.get("kpi_brief"),
         "trend_summary": (summary.get("kpi_brief") or {}).get("trend_summary"),
@@ -1449,6 +1632,8 @@ def build_llm_prompt(
     다음은 현재 사용자가 Excel에서 선택한 표 영역을 읽어 요약한 데이터입니다.
     이 정보를 바탕으로 한국어로 알기 쉽게 해석해 주세요.
     우선순위는 1) table_main_points 2) kpi_brief 3) trend_summary / top_categories / top_performers 4) typo_candidates / merge_candidates / anomaly_text_candidates 5) data_quality_notes 6) summary 7) preview_rows 입니다.
+    사용자가 지정한 label/time/metric 기준을 자동 추론보다 우선 신뢰하세요.
+    merge 후보 반영 여부와 total row 제외 여부를 analysis_config 기준으로 해석하세요.
     현재 표의 핵심 내용부터 설명하세요.
     데이터 품질 이슈보다 본 표의 주요 수치와 구조를 먼저 설명하세요.
     결측 경고만 반복하지 말고, 결측률만으로 답변을 채우지 마세요.
@@ -1466,14 +1651,17 @@ def build_llm_prompt(
     """.strip()
 
 
-def run_selection_analysis(mode: str) -> str:
-    selection_data = get_current_excel_selection()
-    table = selection_to_table(selection_data)
+def analyze_selection_data(selection_data: dict, mode: str, config: AnalysisConfig | None = None) -> dict:
+    config = config or get_default_analysis_config()
+    table = selection_to_table(selection_data, config=config)
 
     if not table["rows"]:
         raise RuntimeError("선택 범위에 데이터 행이 없습니다.")
 
-    summary = summarize_table(table)
+    summary = summarize_table(table, config=config)
+    if not summary.get("numeric_columns"):
+        raise RuntimeError("분석할 metric column이 없습니다. 숫자형 컬럼을 1개 이상 선택하세요.")
+
     insight_summary = build_insight_summary(summary)
     preview_rows = build_preview_rows(table, limit=8)
     basic_summary = build_basic_summary_text(selection_data, table, summary)
@@ -1500,7 +1688,21 @@ def run_selection_analysis(mode: str) -> str:
     )
     llm_text = extract_llm_text(result)
 
-    return f"{basic_summary}\n\n[LLM 결과]\n{llm_text}"
+    return {
+        "table": table,
+        "summary": summary,
+        "insight_summary": insight_summary,
+        "preview_rows": preview_rows,
+        "basic_summary": basic_summary,
+        "llm_text": llm_text,
+        "result_text": f"{basic_summary}\n\n[LLM 결과]\n{llm_text}",
+    }
+
+
+def run_selection_analysis(mode: str, config: AnalysisConfig | None = None, selection_data: dict | None = None) -> str:
+    selection_data = selection_data or get_current_excel_selection()
+    analysis_result = analyze_selection_data(selection_data=selection_data, mode=mode, config=config)
+    return analysis_result["result_text"]
 
 
 def get_mock_tables() -> list[dict]:
@@ -1587,6 +1789,71 @@ def run_mock_analysis_tests():
         print(json.dumps(make_json_safe(insight_summary), ensure_ascii=False, indent=2))
 
 
+def build_mock_selection_data_from_table(table: dict, use_first_row_as_header: bool = True) -> dict:
+    headers = table["headers"]
+    raw_values = []
+    if use_first_row_as_header:
+        raw_values.append(headers)
+        for row in table["rows"]:
+            raw_values.append([row.get(header) for header in headers])
+    else:
+        for row in table["rows"]:
+            raw_values.append([row.get(header) for header in headers])
+
+    selection_data = {
+        "workbook_name": "mock.xlsx",
+        "sheet_name": table.get("name", "MockSheet"),
+        "address": table.get("table_range", {}).get("address", "A1"),
+        "raw_values": raw_values,
+        "headers": headers if use_first_row_as_header else [f"COL_{idx}" for idx in range(1, len(headers) + 1)],
+        "rows": table["rows"],
+    }
+    return selection_data
+
+
+def run_mock_config_tests():
+    print("[Mock config tests]")
+
+    table = get_mock_tables()[0]
+    selection_data = build_mock_selection_data_from_table(table)
+    configs = [
+        ("label_by_region", AnalysisConfig(selected_label_column="지역", selected_metric_columns=["매출", "수량"])),
+        ("label_by_product", AnalysisConfig(selected_label_column="제품명", selected_metric_columns=["매출", "수량"])),
+        ("total_exclude_on", AnalysisConfig(exclude_total_rows=True, selected_metric_columns=["매출", "수량"])),
+        ("total_exclude_off", AnalysisConfig(exclude_total_rows=False, selected_metric_columns=["매출", "수량"])),
+        ("merge_off", AnalysisConfig(apply_merge_candidates=False, selected_metric_columns=["매출", "수량"])),
+        ("merge_on", AnalysisConfig(apply_merge_candidates=True, selected_metric_columns=["매출", "수량"])),
+    ]
+
+    header_on_selection = build_mock_selection_data_from_table(get_mock_tables()[2], use_first_row_as_header=True)
+    header_off_selection = build_mock_selection_data_from_table(get_mock_tables()[2], use_first_row_as_header=False)
+    configs.extend([
+        ("header_on", AnalysisConfig(use_first_row_as_header=True, selected_metric_columns=["불량수"])),
+        ("header_off", AnalysisConfig(use_first_row_as_header=False)),
+    ])
+
+    for name, config in configs:
+        current_selection = header_off_selection if name == "header_off" else header_on_selection if name == "header_on" else selection_data
+        table_result = selection_to_table(current_selection, config=config)
+        summary = summarize_table(table_result, config=config)
+        print(f"\n=== {name} ===")
+        print("[analysis_config]")
+        print(json.dumps(make_json_safe(summary.get("analysis_config")), ensure_ascii=False, indent=2))
+        print("[selected]")
+        selected_info = {
+            "label": summary.get("analysis_config", {}).get("selected_label_column"),
+            "time": summary.get("analysis_config", {}).get("selected_time_column"),
+            "metrics": summary.get("analysis_config", {}).get("selected_metric_columns"),
+        }
+        print(json.dumps(make_json_safe(selected_info), ensure_ascii=False, indent=2))
+        print("[category_shares]")
+        print(json.dumps(make_json_safe(summary.get("category_shares")), ensure_ascii=False, indent=2))
+        print("[trend_analysis]")
+        print(json.dumps(make_json_safe(summary.get("trend_analysis")), ensure_ascii=False, indent=2))
+        print("[table_main_points]")
+        print(json.dumps(make_json_safe(summary.get("table_main_points")), ensure_ascii=False, indent=2))
+
+
 # =========================================================
 # 7) Tkinter UI
 # =========================================================
@@ -1595,10 +1862,27 @@ class ExcelLLMApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Excel 선택영역 LLM 요약기")
-        self.root.geometry("1100x760")
+        self.root.geometry("1280x900")
 
         self.status_var = tk.StringVar(value="준비됨")
         self.mode_var = tk.StringVar(value="summary")
+        self.selection_info_var = tk.StringVar(value="선택영역을 아직 불러오지 않았습니다.")
+        self.headers_var = tk.StringVar(value="-")
+        self.auto_label_var = tk.StringVar(value="-")
+        self.auto_time_var = tk.StringVar(value="-")
+        self.auto_metrics_var = tk.StringVar(value="-")
+        self.auto_total_rows_var = tk.StringVar(value="-")
+
+        self.selection_data: dict | None = None
+        self.auto_summary: dict | None = None
+        self.metric_vars: dict[str, tk.BooleanVar] = {}
+        self.metric_checkbuttons: list[ttk.Checkbutton] = []
+
+        self.label_var = tk.StringVar(value="자동 추론 사용")
+        self.time_var = tk.StringVar(value="자동 추론 사용")
+        self.exclude_total_rows_var = tk.BooleanVar(value=True)
+        self.apply_merge_candidates_var = tk.BooleanVar(value=False)
+        self.use_first_row_header_var = tk.BooleanVar(value=True)
 
         self._build_ui()
 
@@ -1626,7 +1910,10 @@ class ExcelLLMApp:
         btn_frame = ttk.Frame(top)
         btn_frame.pack(fill="x", pady=(0, 10))
 
-        self.btn_run = ttk.Button(btn_frame, text="선택영역 분석 실행", command=self.on_run)
+        self.btn_load = ttk.Button(btn_frame, text="선택영역 불러오기", command=self.on_load_selection)
+        self.btn_load.pack(side="left", padx=(0, 8))
+
+        self.btn_run = ttk.Button(btn_frame, text="현재 설정으로 분석 실행", command=self.on_run)
         self.btn_run.pack(side="left", padx=(0, 8))
 
         self.btn_copy = ttk.Button(btn_frame, text="결과 복사", command=self.on_copy)
@@ -1644,6 +1931,78 @@ class ExcelLLMApp:
         ttk.Label(status_frame, text="상태:", font=("맑은 고딕", 10, "bold")).pack(side="left")
         ttk.Label(status_frame, textvariable=self.status_var).pack(side="left", padx=(6, 0))
 
+        self._build_config_panel()
+        self._build_preview_panel()
+        self._build_result_panel()
+
+    def _build_config_panel(self):
+        config_frame = ttk.LabelFrame(self.root, text="분석 설정", padding=12)
+        config_frame.pack(fill="x", padx=12, pady=(0, 10))
+
+        info_frame = ttk.Frame(config_frame)
+        info_frame.pack(fill="x")
+
+        ttk.Label(info_frame, textvariable=self.selection_info_var).grid(row=0, column=0, columnspan=4, sticky="w", pady=(0, 6))
+        ttk.Label(info_frame, text="Headers:", font=("맑은 고딕", 9, "bold")).grid(row=1, column=0, sticky="nw")
+        ttk.Label(info_frame, textvariable=self.headers_var, wraplength=980).grid(row=1, column=1, columnspan=3, sticky="w")
+        ttk.Label(info_frame, text="자동 label:", font=("맑은 고딕", 9, "bold")).grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(info_frame, textvariable=self.auto_label_var).grid(row=2, column=1, sticky="w", pady=(4, 0))
+        ttk.Label(info_frame, text="자동 time:", font=("맑은 고딕", 9, "bold")).grid(row=2, column=2, sticky="w", pady=(4, 0))
+        ttk.Label(info_frame, textvariable=self.auto_time_var).grid(row=2, column=3, sticky="w", pady=(4, 0))
+        ttk.Label(info_frame, text="자동 metrics:", font=("맑은 고딕", 9, "bold")).grid(row=3, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(info_frame, textvariable=self.auto_metrics_var, wraplength=400).grid(row=3, column=1, sticky="w", pady=(4, 0))
+        ttk.Label(info_frame, text="감지 total rows:", font=("맑은 고딕", 9, "bold")).grid(row=3, column=2, sticky="w", pady=(4, 0))
+        ttk.Label(info_frame, textvariable=self.auto_total_rows_var).grid(row=3, column=3, sticky="w", pady=(4, 0))
+
+        control_frame = ttk.Frame(config_frame)
+        control_frame.pack(fill="x", pady=(10, 0))
+
+        ttk.Label(control_frame, text="Label column").grid(row=0, column=0, sticky="w")
+        self.label_combo = ttk.Combobox(control_frame, textvariable=self.label_var, state="readonly", width=28)
+        self.label_combo.grid(row=0, column=1, sticky="w", padx=(6, 18))
+
+        ttk.Label(control_frame, text="Time column").grid(row=0, column=2, sticky="w")
+        self.time_combo = ttk.Combobox(control_frame, textvariable=self.time_var, state="readonly", width=24)
+        self.time_combo.grid(row=0, column=3, sticky="w", padx=(6, 0))
+
+        option_frame = ttk.Frame(config_frame)
+        option_frame.pack(fill="x", pady=(10, 0))
+        ttk.Checkbutton(
+            option_frame,
+            text="합계/총계 행 제외 후 분석",
+            variable=self.exclude_total_rows_var,
+            command=self.on_config_option_changed,
+        ).pack(side="left", padx=(0, 14))
+        ttk.Checkbutton(option_frame, text="자동 병합 후보 반영", variable=self.apply_merge_candidates_var).pack(side="left", padx=(0, 14))
+        ttk.Checkbutton(
+            option_frame,
+            text="첫 행을 헤더로 사용",
+            variable=self.use_first_row_header_var,
+            command=self.on_config_option_changed,
+        ).pack(side="left")
+
+        metric_frame = ttk.LabelFrame(config_frame, text="Metric columns", padding=8)
+        metric_frame.pack(fill="x", pady=(10, 0))
+        self.metric_checks_frame = ttk.Frame(metric_frame)
+        self.metric_checks_frame.pack(fill="x")
+
+        merge_frame = ttk.LabelFrame(config_frame, text="Merge / Typo 후보", padding=8)
+        merge_frame.pack(fill="x", pady=(10, 0))
+        self.merge_text = tk.Text(merge_frame, height=5, wrap="word", font=("Consolas", 9))
+        self.merge_text.pack(fill="x")
+        self.merge_text.configure(state="disabled")
+
+    def _build_preview_panel(self):
+        preview_frame = ttk.LabelFrame(self.root, text="선택영역 미리보기", padding=12)
+        preview_frame.pack(fill="both", expand=False, padx=12, pady=(0, 10))
+
+        self.preview_tree = ttk.Treeview(preview_frame, show="headings", height=8)
+        self.preview_tree.pack(side="left", fill="both", expand=True)
+        preview_scroll = ttk.Scrollbar(preview_frame, orient="vertical", command=self.preview_tree.yview)
+        preview_scroll.pack(side="right", fill="y")
+        self.preview_tree.configure(yscrollcommand=preview_scroll.set)
+
+    def _build_result_panel(self):
         result_frame = ttk.Frame(self.root, padding=(12, 0, 12, 12))
         result_frame.pack(fill="both", expand=True)
 
@@ -1653,6 +2012,120 @@ class ExcelLLMApp:
         scroll = ttk.Scrollbar(result_frame, orient="vertical", command=self.txt.yview)
         scroll.pack(side="right", fill="y")
         self.txt.configure(yscrollcommand=scroll.set)
+
+    def _render_metric_checkboxes(self, metrics: list[str], default_selected: list[str]):
+        for checkbutton in self.metric_checkbuttons:
+            checkbutton.destroy()
+        self.metric_checkbuttons.clear()
+        self.metric_vars.clear()
+
+        for idx, metric in enumerate(metrics):
+            var = tk.BooleanVar(value=(metric in default_selected))
+            self.metric_vars[metric] = var
+            check = ttk.Checkbutton(self.metric_checks_frame, text=metric, variable=var)
+            check.grid(row=idx // 4, column=idx % 4, sticky="w", padx=(0, 12), pady=2)
+            self.metric_checkbuttons.append(check)
+
+    def _render_merge_preview(self, summary: dict):
+        lines = []
+        for candidate in summary.get("typo_candidates", []):
+            lines.append(
+                f"[typo] {candidate['column']}: {candidate['canonical_candidate']} <= {', '.join(candidate['similar_values'])} ({candidate['reason']})"
+            )
+        for candidate in summary.get("merge_candidates", []):
+            lines.append(
+                f"[merge] {candidate['column']}: {candidate['canonical_candidate']} <= {', '.join(candidate['merge_values'])}"
+            )
+        if not lines:
+            lines = ["후보 없음"]
+
+        self.merge_text.configure(state="normal")
+        self.merge_text.delete("1.0", "end")
+        self.merge_text.insert("1.0", "\n".join(lines))
+        self.merge_text.configure(state="disabled")
+
+    def _render_preview_tree(self, selection_data: dict):
+        for item in self.preview_tree.get_children():
+            self.preview_tree.delete(item)
+        self.preview_tree["columns"] = ()
+
+        raw_values = selection_data.get("raw_values") or []
+        if not raw_values:
+            return
+
+        col_count = max(len(row) for row in raw_values)
+        columns = [f"C{idx}" for idx in range(1, col_count + 1)]
+        self.preview_tree["columns"] = columns
+        for idx, column in enumerate(columns):
+            self.preview_tree.heading(column, text=f"COL_{idx + 1}")
+            self.preview_tree.column(column, width=120, anchor="w")
+
+        for row in raw_values[:8]:
+            values = row + [None] * (col_count - len(row))
+            self.preview_tree.insert("", "end", values=values)
+
+    def _build_config_from_ui(self) -> AnalysisConfig:
+        selected_metrics = [metric for metric, var in self.metric_vars.items() if var.get()]
+        if not selected_metrics:
+            raise RuntimeError("metric column이 하나도 선택되지 않았습니다.")
+
+        return AnalysisConfig(
+            selected_label_column=normalize_config_value(self.label_var.get()),
+            selected_time_column=None if self.time_var.get() == "자동 추론 사용" else self.time_var.get(),
+            selected_metric_columns=selected_metrics,
+            exclude_total_rows=self.exclude_total_rows_var.get(),
+            apply_merge_candidates=self.apply_merge_candidates_var.get(),
+            use_first_row_as_header=self.use_first_row_header_var.get(),
+        )
+
+    def _refresh_analysis_settings(self, selection_data: dict):
+        previous_label = self.label_var.get()
+        previous_time = self.time_var.get()
+        previous_metric_selection = {metric: var.get() for metric, var in self.metric_vars.items()}
+
+        preview_config = AnalysisConfig(
+            use_first_row_as_header=self.use_first_row_header_var.get(),
+            exclude_total_rows=self.exclude_total_rows_var.get(),
+        )
+        table = selection_to_table(selection_data, config=preview_config)
+        candidates = build_analysis_candidates(table)
+        summary = candidates["summary"]
+        self.auto_summary = summary
+        self.selection_info_var.set(
+            f"Workbook={selection_data['workbook_name']} | Sheet={selection_data['sheet_name']} | Range={selection_data['address']}"
+        )
+        self.headers_var.set(", ".join(table["headers"]) if table["headers"] else "-")
+        self.auto_label_var.set(summary.get("label_column") or "-")
+        self.auto_time_var.set(summary.get("time_columns", ["-"])[0] if summary.get("time_columns") else "-")
+        self.auto_metrics_var.set(", ".join(summary.get("numeric_columns", [])) or "-")
+        self.auto_total_rows_var.set(str(summary.get("total_rows_count", 0)))
+
+        self.label_combo["values"] = candidates["label_candidates"]
+        self.time_combo["values"] = candidates["time_candidates"]
+        self.label_var.set(previous_label if previous_label in candidates["label_candidates"] else "자동 추론 사용")
+        self.time_var.set(previous_time if previous_time in candidates["time_candidates"] else "자동 추론 사용")
+        default_metrics = [
+            metric for metric in candidates["metric_candidates"]
+            if previous_metric_selection.get(metric, metric in summary.get("numeric_columns", []))
+        ]
+        self._render_metric_checkboxes(candidates["metric_candidates"], default_metrics)
+        self._render_merge_preview(summary)
+        self._render_preview_tree(selection_data)
+
+    def on_config_option_changed(self):
+        if self.selection_data:
+            self._refresh_analysis_settings(self.selection_data)
+
+    def on_load_selection(self):
+        try:
+            self.set_status("선택영역을 읽는 중...")
+            selection_data = get_current_excel_selection()
+            self.selection_data = selection_data
+            self._refresh_analysis_settings(selection_data)
+            self.set_status("선택영역과 분석 설정을 불러왔습니다.")
+        except Exception as e:
+            messagebox.showerror("오류", str(e))
+            self.set_status("오류 발생")
 
     def set_status(self, text: str):
         self.status_var.set(text)
@@ -1664,13 +2137,19 @@ class ExcelLLMApp:
         self.txt.see("1.0")
 
     def on_run(self):
+        if not self.selection_data:
+            self.on_load_selection()
+            if not self.selection_data:
+                return
+
         self.btn_run.config(state="disabled")
-        self.set_status("분석 중... Excel 선택영역을 읽고 LLM 호출 중")
+        self.set_status("분석 중... 설정 반영 후 LLM 호출 중")
 
         def worker():
             try:
                 mode = self.mode_var.get()
-                result_text = run_selection_analysis(mode)
+                config = self._build_config_from_ui()
+                result_text = run_selection_analysis(mode, config=config, selection_data=self.selection_data)
                 self.root.after(0, lambda: self.append_text(result_text))
                 self.root.after(0, lambda: self.set_status("완료"))
             except Exception as e:
@@ -1698,8 +2177,9 @@ class ExcelLLMApp:
         msg = (
             "1. Excel 데스크톱 앱에서 파일을 연다.\n"
             "2. 요약할 범위를 드래그해서 선택한다.\n"
-            "3. 첫 행은 헤더, 아래 행은 데이터여야 한다.\n"
-            "4. 이 앱에서 분석 유형을 고른 뒤 '선택영역 분석 실행'을 누른다.\n\n"
+            "3. '선택영역 불러오기'로 미리보기와 자동 추론 결과를 확인한다.\n"
+            "4. label/time/metric/total row/merge/header 옵션을 필요시 수정한다.\n"
+            "5. 분석 유형을 고른 뒤 '현재 설정으로 분석 실행'을 누른다.\n\n"
             "주의:\n"
             "- Windows + Excel 데스크톱 환경 기준\n"
             "- Excel Online / LibreOffice는 지원하지 않음\n"
@@ -1711,6 +2191,9 @@ class ExcelLLMApp:
 def main():
     if os.getenv("RUN_MOCK_TESTS") == "1" or "--mock-test" in sys.argv:
         run_mock_analysis_tests()
+        return
+    if os.getenv("RUN_MOCK_CONFIG_TESTS") == "1" or "--mock-config-test" in sys.argv:
+        run_mock_config_tests()
         return
     root = tk.Tk()
     ExcelLLMApp(root)
