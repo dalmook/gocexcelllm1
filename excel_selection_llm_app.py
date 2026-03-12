@@ -1689,6 +1689,27 @@ def normalize_mail_text(text: str) -> str:
     return cleaned
 
 
+def sanitize_markdown_for_tk(text: str) -> str:
+    cleaned = text or ""
+    cleaned = re.sub(r"```[\s\S]*?```", lambda m: re.sub(r"^```[^\n]*\n?|\n?```$", "", m.group(0)).strip(), cleaned)
+    cleaned = re.sub(r"(?m)^\s{0,3}#{1,6}\s*", "", cleaned)
+    cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"__(.*?)__", r"\1", cleaned)
+    cleaned = re.sub(r"`([^`]*)`", r"\1", cleaned)
+    cleaned = re.sub(r"(?m)^\s*[-*]\s+(?=\S)", "- ", cleaned)
+    cleaned = re.sub(r"(?m)^\s*>\s?", "", cleaned)
+    return normalize_mail_text(cleaned)
+
+
+REPLY_STYLE_GUIDES = {
+    "정중형": "공손하고 무난한 한국어 업무 메일 톤으로 작성하세요.",
+    "간결형": "짧고 빠른 실무 톤으로 작성하되 예의는 유지하세요.",
+    "확인중형": "검토 또는 확인 후 회신 예정이라는 방향을 중심으로 작성하세요.",
+    "긍정회신형": "가능한 범위에서 협조 또는 진행 의사를 표현하되 과한 확답은 피하세요.",
+    "보류형": "즉답이 어렵고 추가 확인이 필요하다는 방향을 분명히 하세요.",
+}
+
+
 def decode_mime_header(value: str | None) -> str:
     if not value:
         return ""
@@ -2096,6 +2117,9 @@ def build_mail_summary_prompt(subject: str, body: str, structured_info: dict | N
 - 일정/기한 언급이 있으면 짚으세요.
 - 없는 사실을 추정하지 마세요.
 - 구조화 분석 결과가 있으면 그것을 우선 사용하세요.
+- Markdown 문법 사용 금지
+- 일반 텍스트로만 출력
+- 섹션 제목은 [제목] 형태로 작성
 - 아래 형식을 유지하세요.
 
 ===== 메일 핵심 요약 =====
@@ -2119,25 +2143,34 @@ def build_mail_summary_prompt(subject: str, body: str, structured_info: dict | N
     """.strip()
 
 
-def build_mail_reply_prompt(subject: str, body: str, structured_info: dict | None = None) -> str:
+def build_mail_reply_prompt(subject: str, body: str, structured_info: dict | None = None, reply_style: str = "정중형") -> str:
     payload = {
         "subject": subject.strip() if subject else "",
         "body": normalize_mail_text(body),
         "structured_info": structured_info or {},
+        "reply_style": reply_style,
     }
+    style_guide = REPLY_STYLE_GUIDES.get(reply_style, REPLY_STYLE_GUIDES["정중형"])
     return f"""
 다음 메일에 대한 한국어 업무 메일 답장 초안을 작성하세요.
 
 규칙:
-- 정중한 한국어 업무 메일 톤을 유지하세요.
+- 답장 스타일: {reply_style}
+- {style_guide}
 - 지나치게 장황하지 않게 작성하세요.
 - 원문에 없는 사실을 추가하지 마세요.
 - 원문 근거 없는 확답은 금지합니다.
 - 불확실한 내용은 '확인 후 회신드리겠습니다'처럼 중립적으로 표현하세요.
 - 요청 수락/보류/확인 중 모두 가능한 중립적 표현을 허용합니다.
 - mail_type, request list, check_items, deadline/schedule mentions가 있으면 반영하세요.
+- Markdown 문법 사용 금지
+- 일반 텍스트로만 출력
+- 섹션 제목은 [제목] 형태로 작성
 - 아래 형식을 유지하세요.
 
+===== 자동 답장문구 =====
+[답장 스타일]
+{reply_style}
 [메일 유형]
 ...
 [답장 초안]
@@ -2161,6 +2194,9 @@ def build_mail_inspection_prompt(subject: str, body: str, structured_info: dict 
 - 원문에 없는 사실을 추가하지 마세요.
 - 어색한 표현, 중복, 과도한 표현, 불명확한 요청 문구를 우선 짚으세요.
 - 수정 제안은 간결하게 작성하세요.
+- Markdown 문법 사용 금지
+- 일반 텍스트로만 출력
+- 섹션 제목은 [제목] 형태로 작성
 - 아래 형식을 유지하세요.
 
 ===== 메일 표현 점검 =====
@@ -2215,10 +2251,10 @@ def summarize_mail_content(subject: str, body: str, structured_info: dict | None
         temperature=0.2,
         max_tokens=1200,
     )
-    return extract_llm_text(result)
+    return sanitize_markdown_for_tk(extract_llm_text(result))
 
 
-def generate_mail_reply(subject: str, body: str, structured_info: dict | None = None) -> str:
+def generate_mail_reply(subject: str, body: str, structured_info: dict | None = None, reply_style: str = "정중형") -> str:
     normalized_body = normalize_mail_text(body)
     if not normalized_body:
         raise RuntimeError("메일 본문이 비어 있습니다.")
@@ -2228,12 +2264,12 @@ def generate_mail_reply(subject: str, body: str, structured_info: dict | None = 
         "정중하고 간결하게 쓰되, 근거 없는 확답과 사실 추가는 금지합니다."
     )
     result = call_gpt_oss(
-        prompt=build_mail_reply_prompt(subject, normalized_body, structured_info=structured_info),
+        prompt=build_mail_reply_prompt(subject, normalized_body, structured_info=structured_info, reply_style=reply_style),
         system_prompt=system_prompt,
         temperature=0.2,
         max_tokens=1200,
     )
-    return extract_llm_text(result)
+    return sanitize_markdown_for_tk(extract_llm_text(result))
 
 
 def inspect_mail_expression(subject: str, body: str, structured_info: dict | None = None) -> dict:
@@ -2251,7 +2287,7 @@ def inspect_mail_expression(subject: str, body: str, structured_info: dict | Non
         temperature=0.2,
         max_tokens=1000,
     )
-    result_text = extract_llm_text(result)
+    result_text = sanitize_markdown_for_tk(extract_llm_text(result))
     inspection_notes = []
     for line in result_text.splitlines():
         line = line.strip()
@@ -2580,6 +2616,7 @@ def run_mail_analysis(
     structured_info: dict | None = None,
     summary_text: str | None = None,
     inspection_info: dict | None = None,
+    reply_style: str = "정중형",
 ) -> dict:
     normalized_body = normalize_mail_text(body)
     if not normalized_body:
@@ -2600,7 +2637,7 @@ def run_mail_analysis(
             "result_text": summary_text,
         }
     if mode == "reply":
-        reply_text = generate_mail_reply(subject, normalized_body, structured_info=structured_info)
+        reply_text = generate_mail_reply(subject, normalized_body, structured_info=structured_info, reply_style=reply_style)
         return {
             "mode": mode,
             "structured_info": structured_info,
@@ -3092,6 +3129,7 @@ class ExcelLLMApp:
         self.selected_mail_info_var = tk.StringVar(value="선택 메일: 없음")
         self.mail_result_type_var = tk.StringVar(value="현재 결과: 없음")
         self.mail_result_meta_var = tk.StringVar(value="메일 메타: 없음")
+        self.mail_reply_style_var = tk.StringVar(value="정중형")
 
         self.selection_data: dict | None = None
         self.auto_summary: dict | None = None
@@ -3360,6 +3398,15 @@ class ExcelLLMApp:
             values=list(MAIL_HTML_STYLE_MAP.keys()),
         )
         self.mail_html_style_combo.pack(side="left")
+        ttk.Label(option_frame, text="답장 스타일", width=10).pack(side="left", padx=(14, 0))
+        self.mail_reply_style_combo = ttk.Combobox(
+            option_frame,
+            textvariable=self.mail_reply_style_var,
+            state="readonly",
+            width=12,
+            values=list(REPLY_STYLE_GUIDES.keys()),
+        )
+        self.mail_reply_style_combo.pack(side="left")
 
         body_frame = ttk.LabelFrame(input_frame, text="메일 본문", padding=6)
         body_frame.pack(fill="both", expand=True)
@@ -3567,7 +3614,7 @@ class ExcelLLMApp:
 
     def append_mail_result(self, text: str):
         self.mail_result_text.delete("1.0", "end")
-        self.mail_result_text.insert("1.0", text)
+        self.mail_result_text.insert("1.0", sanitize_markdown_for_tk(text))
         self.mail_result_text.see("1.0")
 
     def _result_type_label(self, result_type: str | None) -> str:
@@ -3740,6 +3787,7 @@ class ExcelLLMApp:
         self.mail_btn_html.config(state="disabled")
         self.set_mail_status(action_name)
         mail_meta = self.current_mail_meta or self._build_current_mail_meta(subject)
+        reply_style = self.mail_reply_style_var.get().strip() or "정중형"
 
         def worker():
             try:
@@ -3749,6 +3797,7 @@ class ExcelLLMApp:
                     body,
                     structured_info=self.mail_structured_info,
                     inspection_info=self.mail_inspection_info,
+                    reply_style=reply_style,
                 )
                 self.mail_structured_info = analysis_result.get("structured_info")
                 self.mail_inspection_info = analysis_result.get("inspection_info", self.mail_inspection_info)
