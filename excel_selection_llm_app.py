@@ -3377,6 +3377,7 @@ class ExcelLLMApp:
         action_frame = ttk.LabelFrame(parent, text="분석 실행", padding=10)
         action_frame.pack(fill="x", pady=(0, 10))
 
+        ttk.Label(action_frame, text="실행", font=("맑은 고딕", 9, "bold"), foreground="#35506b").pack(anchor="w", pady=(0, 4))
         top_row = ttk.Frame(action_frame)
         top_row.pack(fill="x", pady=(0, 6))
         self.mail_btn_structure = ttk.Button(top_row, text="구조화 분석", command=self.on_mail_structure)
@@ -3395,6 +3396,19 @@ class ExcelLLMApp:
         self.mail_btn_clear = ttk.Button(bottom_row, text="입력 지우기", command=self.on_mail_clear)
         self.mail_btn_clear.pack(side="left")
 
+        ttk.Separator(action_frame, orient="horizontal").pack(fill="x", pady=10)
+        ttk.Label(action_frame, text="결과 활용", font=("맑은 고딕", 9, "bold"), foreground="#35506b").pack(anchor="w", pady=(0, 4))
+        result_row = ttk.Frame(action_frame)
+        result_row.pack(fill="x")
+        self.mail_btn_copy = ttk.Button(result_row, text="결과 복사", command=self.on_mail_copy)
+        self.mail_btn_copy.pack(side="left", padx=(0, 6))
+        self.mail_btn_copy_html = ttk.Button(result_row, text="HTML만 복사", command=self.on_mail_copy_html)
+        self.mail_btn_copy_html.pack(side="left", padx=(0, 6))
+        self.mail_btn_save_html = ttk.Button(result_row, text="HTML 저장", command=self.on_mail_save_html)
+        self.mail_btn_save_html.pack(side="left", padx=(0, 6))
+        self.mail_btn_clear_result = ttk.Button(result_row, text="결과 지우기", command=self.on_mail_clear_result)
+        self.mail_btn_clear_result.pack(side="left")
+
     def _build_mail_result_section(self, parent: ttk.Frame):
         result_wrap = ttk.LabelFrame(parent, text="결과 워크스페이스", padding=10)
         result_wrap.pack(fill="both", expand=True)
@@ -3405,17 +3419,6 @@ class ExcelLLMApp:
         left_meta.pack(side="left", fill="x", expand=True)
         ttk.Label(left_meta, textvariable=self.mail_result_type_var, font=("맑은 고딕", 11, "bold")).pack(anchor="w")
         ttk.Label(left_meta, textvariable=self.mail_result_meta_var, foreground="#47617c", wraplength=760).pack(anchor="w", pady=(2, 0))
-
-        result_btn_frame = ttk.Frame(header)
-        result_btn_frame.pack(side="right")
-        self.mail_btn_copy = ttk.Button(result_btn_frame, text="결과 복사", command=self.on_mail_copy)
-        self.mail_btn_copy.pack(side="left", padx=(0, 6))
-        self.mail_btn_copy_html = ttk.Button(result_btn_frame, text="HTML만 복사", command=self.on_mail_copy_html)
-        self.mail_btn_copy_html.pack(side="left", padx=(0, 6))
-        self.mail_btn_save_html = ttk.Button(result_btn_frame, text="HTML 저장", command=self.on_mail_save_html)
-        self.mail_btn_save_html.pack(side="left", padx=(0, 6))
-        self.mail_btn_clear_result = ttk.Button(result_btn_frame, text="결과 지우기", command=self.on_mail_clear_result)
-        self.mail_btn_clear_result.pack(side="left")
 
         status_frame = ttk.Frame(result_wrap)
         status_frame.pack(fill="x", pady=(0, 8))
