@@ -7,13 +7,19 @@ import sys
 import uuid
 import math
 import difflib
-from datetime import datetime, date
+import poplib
+import html as html_lib
+from datetime import datetime, date, timedelta
 from dataclasses import dataclass, field
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
 from tkinter import filedialog
 from tkinter import scrolledtext
+from email import policy
+from email.header import decode_header
+from email.parser import BytesParser
+from email.utils import parseaddr, parsedate_to_datetime
 
 import requests
 try:
@@ -186,6 +192,29 @@ class AnalysisConfig:
 
 def get_default_analysis_config() -> AnalysisConfig:
     return AnalysisConfig()
+
+
+@dataclass
+class MailQueryParams:
+    user_id: str
+    password: str
+    keyword: str = ""
+    recent_days: int = 7
+    max_count: int = 20
+    host: str = os.getenv("POP3_HOST", "pop3.samsung.net")
+    port: int = int(os.getenv("POP3_PORT", "995"))
+    use_ssl: bool = os.getenv("POP3_USE_SSL", "1") != "0"
+
+
+@dataclass
+class MailItem:
+    index: int
+    uid: str
+    subject: str
+    sender: str
+    date_str: str
+    date_obj: datetime | None
+    body: str
 
 
 MONTH_TOKEN_PATTERN = re.compile(
@@ -1660,6 +1689,245 @@ def normalize_mail_text(text: str) -> str:
     return cleaned
 
 
+def decode_mime_header(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        parts = []
+        for chunk, encoding in decode_header(value):
+            if isinstance(chunk, bytes):
+                parts.append(chunk.decode(encoding or "utf-8", errors="replace"))
+            else:
+                parts.append(str(chunk))
+        return "".join(parts).strip()
+    except Exception:
+        return str(value).strip()
+
+
+def clean_text(text: str) -> str:
+    cleaned = normalize_mail_text(html_lib.unescape(text or ""))
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return cleaned
+
+
+def remove_structural_lines(text: str) -> str:
+    lines = []
+    structural_pattern = re.compile(r"^(from|sent|to|cc|subject|date)\s*:", re.IGNORECASE)
+    separator_pattern = re.compile(r"^[-_]{3,}$")
+    for line in clean_text(text).splitlines():
+        stripped = line.strip()
+        if structural_pattern.match(stripped):
+            continue
+        if separator_pattern.match(stripped):
+            continue
+        lines.append(line)
+    return normalize_mail_text("\n".join(lines))
+
+
+def split_sentences(text: str) -> list[str]:
+    normalized = clean_text(text)
+    return [piece.strip() for piece in re.split(r"(?<=[.!?。다])\s+|\n+", normalized) if piece.strip()]
+
+
+def summarize_text(text: str, max_sentences: int = 3) -> str:
+    sentences = split_sentences(text)
+    if not sentences:
+        return ""
+    return " ".join(sentences[:max_sentences])
+
+
+def html_to_text_basic(html_text: str) -> str:
+    text = html_text or ""
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", text)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</p\s*>", "\n\n", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html_lib.unescape(text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return normalize_mail_text(text)
+
+
+def trim_mail_body(text: str, max_len: int = 12000) -> str:
+    trimmed = remove_structural_lines(text)
+    split_patterns = [
+        r"(?m)^On .+wrote:$",
+        r"(?m)^From:\s",
+        r"(?m)^Sent:\s",
+        r"(?m)^-----Original Message-----$",
+        r"(?m)^보낸 사람\s*:",
+        r"(?m)^원본 메시지\s*$",
+    ]
+    for pattern in split_patterns:
+        match = re.search(pattern, trimmed)
+        if match:
+            trimmed = trimmed[:match.start()].rstrip()
+            break
+    if len(trimmed) > max_len:
+        trimmed = trimmed[:max_len].rstrip() + "\n...[truncated]"
+    return normalize_mail_text(trimmed)
+
+
+def extract_body_from_message(msg) -> str:
+    plain_parts = []
+    html_parts = []
+    try:
+        if msg.is_multipart():
+            for part in msg.walk():
+                content_type = part.get_content_type()
+                disposition = (part.get("Content-Disposition") or "").lower()
+                if "attachment" in disposition:
+                    continue
+                try:
+                    payload = part.get_payload(decode=True)
+                    charset = part.get_content_charset() or "utf-8"
+                    decoded = payload.decode(charset, errors="replace") if payload is not None else ""
+                except Exception:
+                    decoded = part.get_payload() if isinstance(part.get_payload(), str) else ""
+                if content_type == "text/plain":
+                    plain_parts.append(decoded)
+                elif content_type == "text/html":
+                    html_parts.append(decoded)
+        else:
+            payload = msg.get_payload(decode=True)
+            charset = msg.get_content_charset() or "utf-8"
+            decoded = payload.decode(charset, errors="replace") if payload is not None else ""
+            if msg.get_content_type() == "text/html":
+                html_parts.append(decoded)
+            else:
+                plain_parts.append(decoded)
+    except Exception:
+        return ""
+
+    if plain_parts:
+        return trim_mail_body("\n\n".join(part for part in plain_parts if part))
+    if html_parts:
+        return trim_mail_body(html_to_text_basic("\n".join(part for part in html_parts if part)))
+    return ""
+
+
+def normalize_mail_search_keyword(keyword: str) -> str:
+    return re.sub(r"\s+", " ", (keyword or "").strip()).lower()
+
+
+def filter_mail_items(items: list[MailItem], keyword: str) -> list[MailItem]:
+    normalized_keyword = normalize_mail_search_keyword(keyword)
+    if not normalized_keyword:
+        return list(items)
+
+    filtered = []
+    for item in items:
+        haystack = normalize_mail_search_keyword(" ".join([item.subject, item.sender, item.body]))
+        if normalized_keyword in haystack:
+            filtered.append(item)
+    return filtered
+
+
+def normalize_mail_datetime(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value
+    try:
+        return value.astimezone().replace(tzinfo=None)
+    except Exception:
+        return value.replace(tzinfo=None)
+
+
+def pop3_connect(user: str, password: str, host: str | None = None, port: int | None = None, use_ssl: bool = True):
+    if not user.strip() or not password:
+        raise RuntimeError("메일함 조회를 위해 사용자 ID와 비밀번호를 입력하세요.")
+
+    host = host or os.getenv("POP3_HOST", "pop3.samsung.net")
+    port = port or int(os.getenv("POP3_PORT", "995"))
+    try:
+        if use_ssl:
+            server = poplib.POP3_SSL(host, port, timeout=20)
+        else:
+            server = poplib.POP3(host, port, timeout=20)
+        server.user(user)
+        server.pass_(password)
+        return server
+    except poplib.error_proto as e:
+        raise RuntimeError(f"POP3 로그인 실패: {e}") from e
+    except Exception as e:
+        raise RuntimeError(f"POP3 연결 실패: {e}") from e
+
+
+def build_mail_item_from_message(index: int, raw_message: bytes) -> MailItem | None:
+    try:
+        msg = BytesParser(policy=policy.default).parsebytes(raw_message)
+        subject = decode_mime_header(msg.get("Subject")) or "(제목 없음)"
+        sender_name, sender_addr = parseaddr(decode_mime_header(msg.get("From")))
+        sender = sender_name or sender_addr or "(발신자 없음)"
+        raw_date = msg.get("Date")
+        try:
+            date_obj = normalize_mail_datetime(parsedate_to_datetime(raw_date)) if raw_date else None
+        except Exception:
+            date_obj = None
+        date_str = date_obj.strftime("%Y-%m-%d %H:%M") if date_obj else (raw_date or "-")
+        body = extract_body_from_message(msg) or "(본문 없음)"
+        uid = msg.get("Message-ID") or f"index-{index}"
+        return MailItem(
+            index=index,
+            uid=str(uid),
+            subject=subject,
+            sender=sender,
+            date_str=date_str,
+            date_obj=date_obj,
+            body=body,
+        )
+    except Exception:
+        return None
+
+
+def fetch_recent_mails(params: MailQueryParams) -> list[MailItem]:
+    server = pop3_connect(
+        user=params.user_id,
+        password=params.password,
+        host=params.host,
+        port=params.port,
+        use_ssl=params.use_ssl,
+    )
+    scanned_items: list[MailItem] = []
+    try:
+        message_count = len(server.list()[1])
+        if message_count <= 0:
+            return []
+
+        cutoff = None
+        if params.recent_days > 0:
+            cutoff = datetime.now() - timedelta(days=params.recent_days)
+
+        scan_limit = min(message_count, max(params.max_count * 5, 60))
+        start_index = message_count
+        end_index = max(message_count - scan_limit + 1, 1)
+
+        for index in range(start_index, end_index - 1, -1):
+            try:
+                _, lines, _ = server.retr(index)
+                raw_message = b"\n".join(lines)
+                item = build_mail_item_from_message(index, raw_message)
+                if not item:
+                    continue
+                item_date = normalize_mail_datetime(item.date_obj)
+                if cutoff and item_date and item_date < cutoff:
+                    continue
+                scanned_items.append(item)
+                if not params.keyword and len(scanned_items) >= params.max_count:
+                    break
+            except Exception:
+                continue
+    finally:
+        try:
+            server.quit()
+        except Exception:
+            pass
+
+    filtered = filter_mail_items(scanned_items, params.keyword)
+    return filtered[:params.max_count]
+
+
 MAIL_TYPE_KEYWORDS = {
     "승인/검토 요청": ["검토 부탁", "검토 요청", "승인 부탁", "승인 요청", "review", "approve"],
     "요청": ["부탁드립니다", "요청드립니다", "회신 부탁", "전달 부탁", "지원 부탁"],
@@ -2468,6 +2736,37 @@ MAIL_SAMPLE_CASES = [
 ]
 
 
+MAIL_FETCH_MOCK_ITEMS = [
+    MailItem(
+        index=101,
+        uid="mock-101",
+        subject="3월 운영 계획 검토 요청",
+        sender="운영기획팀",
+        date_str="2026-03-10 09:00",
+        date_obj=datetime(2026, 3, 10, 9, 0),
+        body="첨부드린 3월 운영 계획안 검토 부탁드립니다. 3월 15일까지 의견 회신 부탁드립니다.",
+    ),
+    MailItem(
+        index=102,
+        uid="mock-102",
+        subject="샘플 출하 일정 공유",
+        sender="SCM팀",
+        date_str="2026-03-11 14:30",
+        date_obj=datetime(2026, 3, 11, 14, 30),
+        body="다음 주 초 샘플 출하 예정입니다. 일정 변경 가능성은 금요일에 다시 공유드리겠습니다.",
+    ),
+    MailItem(
+        index=103,
+        uid="mock-103",
+        subject="고객 장애 이슈 검토 요청",
+        sender="플랫폼개발팀",
+        date_str="2026-03-12 08:15",
+        date_obj=datetime(2026, 3, 12, 8, 15),
+        body="고객사 로그인 오류 관련 원인 파악 후 오늘 오후 3시 전까지 1차 공유 부탁드립니다.",
+    ),
+]
+
+
 def test_mail_prompts():
     print("[Mail prompt tests]")
     for case in MAIL_SAMPLE_CASES:
@@ -2528,6 +2827,41 @@ def test_mail_html_render():
             print(build_mail_presentation_html(context, style=style))
 
 
+def test_mail_filtering():
+    print("[Mail filtering tests]")
+    for keyword in ("검토", "플랫폼", "출하", "없음"):
+        matched = filter_mail_items(MAIL_FETCH_MOCK_ITEMS, keyword)
+        print(f"\n=== keyword={keyword} ===")
+        for item in matched:
+            print(f"- {item.date_str} | {item.sender} | {item.subject}")
+        if not matched:
+            print("- no match")
+
+
+def test_trim_mail_body():
+    print("[Mail trim body test]")
+    source = """
+안녕하세요.
+
+본문 내용입니다.
+확인 부탁드립니다.
+
+-----Original Message-----
+From: test@example.com
+Sent: Monday, March 10, 2026 9:00 AM
+Subject: 이전 메일
+
+이전 메일 내용
+    """
+    print(trim_mail_body(source))
+
+
+def test_html_to_text_basic():
+    print("[Mail html_to_text_basic test]")
+    source = "<html><body><p>안녕하세요.</p><p><b>검토 부탁드립니다.</b><br>3월 15일까지 회신 부탁드립니다.</p></body></html>"
+    print(html_to_text_basic(source))
+
+
 # =========================================================
 # 7) Tkinter UI
 # =========================================================
@@ -2547,6 +2881,12 @@ class ExcelLLMApp:
         self.auto_time_var = tk.StringVar(value="-")
         self.auto_metrics_var = tk.StringVar(value="-")
         self.auto_total_rows_var = tk.StringVar(value="-")
+        self.mail_fetch_user_var = tk.StringVar(value="")
+        self.mail_fetch_password_var = tk.StringVar(value="")
+        self.mail_search_var = tk.StringVar(value="")
+        self.mail_recent_days_var = tk.StringVar(value="7")
+        self.mail_max_count_var = tk.StringVar(value="20")
+        self.selected_mail_info_var = tk.StringVar(value="선택 메일: 없음")
 
         self.selection_data: dict | None = None
         self.auto_summary: dict | None = None
@@ -2561,6 +2901,8 @@ class ExcelLLMApp:
         self.mail_structured_info: dict | None = None
         self.mail_last_html: str = ""
         self.mail_html_style_var = tk.StringVar(value="브리핑형")
+        self.mail_items: list[MailItem] = []
+        self.mail_selected_item: MailItem | None = None
 
         self._build_ui()
 
@@ -2716,6 +3058,65 @@ class ExcelLLMApp:
             font=("맑은 고딕", 10),
         )
         desc.pack(anchor="w", pady=(4, 10))
+
+        query_frame = ttk.LabelFrame(top, text="메일함 조회", padding=10)
+        query_frame.pack(fill="x", pady=(0, 10))
+
+        ttk.Label(query_frame, text="사용자 ID", width=12).grid(row=0, column=0, sticky="w")
+        self.mail_fetch_user_entry = ttk.Entry(query_frame, textvariable=self.mail_fetch_user_var, width=26)
+        self.mail_fetch_user_entry.grid(row=0, column=1, sticky="w", padx=(0, 12))
+
+        ttk.Label(query_frame, text="비밀번호", width=10).grid(row=0, column=2, sticky="w")
+        self.mail_fetch_password_entry = ttk.Entry(
+            query_frame,
+            textvariable=self.mail_fetch_password_var,
+            width=22,
+            show="*",
+        )
+        self.mail_fetch_password_entry.grid(row=0, column=3, sticky="w", padx=(0, 12))
+
+        ttk.Label(query_frame, text="검색어", width=8).grid(row=0, column=4, sticky="w")
+        self.mail_search_entry = ttk.Entry(query_frame, textvariable=self.mail_search_var, width=24)
+        self.mail_search_entry.grid(row=0, column=5, sticky="we")
+
+        ttk.Label(query_frame, text="최근 N일", width=12).grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.mail_recent_days_entry = ttk.Entry(query_frame, textvariable=self.mail_recent_days_var, width=10)
+        self.mail_recent_days_entry.grid(row=1, column=1, sticky="w", pady=(8, 0), padx=(0, 12))
+
+        ttk.Label(query_frame, text="최대 개수", width=10).grid(row=1, column=2, sticky="w", pady=(8, 0))
+        self.mail_max_count_entry = ttk.Entry(query_frame, textvariable=self.mail_max_count_var, width=10)
+        self.mail_max_count_entry.grid(row=1, column=3, sticky="w", pady=(8, 0), padx=(0, 12))
+
+        fetch_btn_frame = ttk.Frame(query_frame)
+        fetch_btn_frame.grid(row=1, column=4, columnspan=2, sticky="e", pady=(8, 0))
+        self.mail_btn_fetch_list = ttk.Button(fetch_btn_frame, text="조회", command=self.on_mail_fetch_list)
+        self.mail_btn_fetch_list.pack(side="left", padx=(0, 8))
+        self.mail_btn_load_selected = ttk.Button(fetch_btn_frame, text="선택 메일 불러오기", command=self.on_mail_load_selected)
+        self.mail_btn_load_selected.pack(side="left", padx=(0, 8))
+        self.mail_btn_clear_login = ttk.Button(fetch_btn_frame, text="로그인 정보 지우기", command=self.on_mail_clear_login)
+        self.mail_btn_clear_login.pack(side="left")
+        query_frame.columnconfigure(5, weight=1)
+
+        list_frame = ttk.LabelFrame(top, text="조회된 메일 목록", padding=8)
+        list_frame.pack(fill="both", expand=False, pady=(0, 10))
+        columns = ("date", "sender", "subject")
+        self.mail_list_tree = ttk.Treeview(list_frame, columns=columns, show="headings", height=7)
+        self.mail_list_tree.heading("date", text="날짜")
+        self.mail_list_tree.heading("sender", text="발신자")
+        self.mail_list_tree.heading("subject", text="제목")
+        self.mail_list_tree.column("date", width=140, anchor="w")
+        self.mail_list_tree.column("sender", width=220, anchor="w")
+        self.mail_list_tree.column("subject", width=620, anchor="w")
+        self.mail_list_tree.pack(side="left", fill="both", expand=True)
+        mail_list_scroll = ttk.Scrollbar(list_frame, orient="vertical", command=self.mail_list_tree.yview)
+        mail_list_scroll.pack(side="right", fill="y")
+        self.mail_list_tree.configure(yscrollcommand=mail_list_scroll.set)
+        self.mail_list_tree.bind("<<TreeviewSelect>>", self.on_mail_result_select)
+        self.mail_list_tree.bind("<Double-1>", self.on_mail_load_selected)
+
+        selected_info_frame = ttk.Frame(top)
+        selected_info_frame.pack(fill="x", pady=(0, 8))
+        ttk.Label(selected_info_frame, textvariable=self.selected_mail_info_var, foreground="#35506b").pack(anchor="w")
 
         subject_frame = ttk.Frame(top)
         subject_frame.pack(fill="x", pady=(0, 8))
@@ -2904,6 +3305,84 @@ class ExcelLLMApp:
         self.mail_result_text.insert("1.0", text)
         self.mail_result_text.see("1.0")
 
+    def _set_mail_fetch_controls_state(self, state: str):
+        self.mail_btn_fetch_list.config(state=state)
+        self.mail_btn_load_selected.config(state=state)
+        self.mail_btn_clear_login.config(state=state)
+
+    def _clear_mail_list(self):
+        for item_id in self.mail_list_tree.get_children():
+            self.mail_list_tree.delete(item_id)
+        self.mail_items = []
+        self.mail_selected_item = None
+        self.selected_mail_info_var.set("선택 메일: 없음")
+
+    def _render_mail_items(self, items: list[MailItem]):
+        self._clear_mail_list()
+        self.mail_items = list(items)
+        for item in items:
+            self.mail_list_tree.insert(
+                "",
+                "end",
+                iid=str(item.index),
+                values=(item.date_str, item.sender, item.subject),
+            )
+        if items:
+            first_id = str(items[0].index)
+            self.mail_list_tree.selection_set(first_id)
+            self.mail_list_tree.focus(first_id)
+            self.on_mail_result_select()
+
+    def _get_mail_query_params(self) -> MailQueryParams:
+        user_id = self.mail_fetch_user_var.get().strip()
+        password = self.mail_fetch_password_var.get()
+        keyword = self.mail_search_var.get().strip()
+        try:
+            recent_days = max(1, int(self.mail_recent_days_var.get().strip() or "7"))
+        except ValueError as e:
+            raise RuntimeError("조회 기간은 숫자로 입력하세요.") from e
+        try:
+            max_count = max(1, min(100, int(self.mail_max_count_var.get().strip() or "20")))
+        except ValueError as e:
+            raise RuntimeError("최대 조회 개수는 숫자로 입력하세요.") from e
+        return MailQueryParams(
+            user_id=user_id,
+            password=password,
+            keyword=keyword,
+            recent_days=recent_days,
+            max_count=max_count,
+        )
+
+    def _find_mail_item_by_tree_selection(self) -> MailItem | None:
+        selected = self.mail_list_tree.selection()
+        if not selected:
+            return None
+        selected_id = selected[0]
+        for item in self.mail_items:
+            if str(item.index) == selected_id:
+                return item
+        return None
+
+    def _apply_mail_item_to_inputs(self, item: MailItem):
+        current_subject = self.mail_subject_entry.get().strip()
+        current_body = self.mail_body_text.get("1.0", "end").strip()
+        if current_subject or current_body:
+            overwrite = messagebox.askyesno(
+                "메일 불러오기",
+                "현재 입력된 제목/본문을 선택한 메일 내용으로 덮어쓸까요?",
+            )
+            if not overwrite:
+                return
+
+        self.mail_subject_entry.delete(0, "end")
+        self.mail_subject_entry.insert(0, item.subject)
+        self.mail_body_text.delete("1.0", "end")
+        self.mail_body_text.insert("1.0", item.body)
+        self.mail_structured_info = None
+        self.mail_last_html = ""
+        self.selected_mail_info_var.set(f"선택 메일: [{item.date_str}] {item.sender} | {item.subject}")
+        self.set_mail_status("메일 불러오기 완료")
+
     def on_run(self):
         if not self.selection_data:
             self.on_load_selection()
@@ -3015,12 +3494,64 @@ class ExcelLLMApp:
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def on_mail_fetch_list(self):
+        try:
+            query_params = self._get_mail_query_params()
+        except RuntimeError as e:
+            messagebox.showwarning("입력 확인", str(e))
+            return
+
+        self._set_mail_fetch_controls_state("disabled")
+        self.set_mail_status("메일함 조회 중...")
+
+        def worker():
+            try:
+                items = fetch_recent_mails(query_params)
+                if not items:
+                    self.root.after(0, self._clear_mail_list)
+                    self.root.after(0, lambda: self.set_mail_status("조회 결과 없음"))
+                    self.root.after(0, lambda: messagebox.showinfo("조회 결과", "조건에 맞는 메일이 없습니다."))
+                    return
+                self.root.after(0, lambda: self._render_mail_items(items))
+                self.root.after(0, lambda: self.set_mail_status("조회 완료"))
+            except Exception as e:
+                self.root.after(0, self._clear_mail_list)
+                error_text = str(e)
+                status_text = "로그인 실패" if "로그인 실패" in error_text else "조회 실패"
+                self.root.after(0, lambda: messagebox.showerror("메일 조회 오류", error_text))
+                self.root.after(0, lambda: self.set_mail_status(status_text))
+            finally:
+                self.root.after(0, lambda: self._set_mail_fetch_controls_state("normal"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def on_mail_result_select(self, event=None):
+        item = self._find_mail_item_by_tree_selection()
+        self.mail_selected_item = item
+        if not item:
+            self.selected_mail_info_var.set("선택 메일: 없음")
+            return
+        self.selected_mail_info_var.set(f"선택 메일: [{item.date_str}] {item.sender} | {item.subject}")
+
+    def on_mail_load_selected(self, event=None):
+        item = self._find_mail_item_by_tree_selection()
+        if not item:
+            messagebox.showinfo("안내", "불러올 메일을 목록에서 먼저 선택하세요.")
+            return
+        self._apply_mail_item_to_inputs(item)
+
+    def on_mail_clear_login(self):
+        self.mail_fetch_password_var.set("")
+        self.mail_fetch_user_var.set("")
+        self.set_mail_status("로그인 정보를 지웠습니다.")
+
     def on_mail_clear(self):
         self.mail_subject_entry.delete(0, "end")
         self.mail_body_text.delete("1.0", "end")
         self.mail_result_text.delete("1.0", "end")
         self.mail_structured_info = None
         self.mail_last_html = ""
+        self.selected_mail_info_var.set("선택 메일: 없음")
         self.set_mail_status("준비됨")
 
     def on_mail_copy(self):
@@ -3109,6 +3640,15 @@ def main():
         return
     if os.getenv("RUN_MAIL_HTML_RENDER_TESTS") == "1" or "--mail-html-render-test" in sys.argv:
         test_mail_html_render()
+        return
+    if os.getenv("RUN_MAIL_FILTER_TESTS") == "1" or "--mail-filter-test" in sys.argv:
+        test_mail_filtering()
+        return
+    if os.getenv("RUN_MAIL_TRIM_TESTS") == "1" or "--mail-trim-test" in sys.argv:
+        test_trim_mail_body()
+        return
+    if os.getenv("RUN_MAIL_HTML_TO_TEXT_TESTS") == "1" or "--mail-html-to-text-test" in sys.argv:
+        test_html_to_text_basic()
         return
     root = tk.Tk()
     ExcelLLMApp(root)
