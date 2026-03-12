@@ -43,6 +43,7 @@ CREDENTIAL_KEY = os.getenv("CREDENTIAL_KEY", "credential:TICKET-96f7bce0-efab-45
 USER_ID = os.getenv("USER_ID", "sungmook.cho")
 USER_TYPE = os.getenv("USER_TYPE", "AD_ID")
 SEND_SYSTEM_NAME = os.getenv("SEND_SYSTEM_NAME", "GOC_MAIL_RAG_PIPELINE")
+LOCAL_UI_SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".mail_ui_settings.json")
 
 
 # =========================================================
@@ -178,6 +179,25 @@ def format_number(x, digits: int = 2) -> str:
     if abs(x - int(x)) < 1e-9:
         return f"{int(x):,}"
     return f"{x:,.{digits}f}"
+
+
+def load_local_ui_settings() -> dict:
+    if not os.path.exists(LOCAL_UI_SETTINGS_PATH):
+        return {}
+    try:
+        with open(LOCAL_UI_SETTINGS_PATH, "r", encoding="utf-8") as fp:
+            data = json.load(fp)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_local_ui_settings(settings: dict):
+    try:
+        with open(LOCAL_UI_SETTINGS_PATH, "w", encoding="utf-8") as fp:
+            json.dump(settings, fp, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
 @dataclass
@@ -3261,8 +3281,12 @@ class ExcelLLMApp:
         self.mail_selected_item: MailItem | None = None
         self.current_result_type: str | None = None
         self.current_mail_meta: dict[str, str] = {}
+        self._settings_trace_ready = False
+
+        self._load_mail_login_settings()
 
         self._build_ui()
+        self._bind_mail_setting_traces()
 
     def _build_ui(self):
         notebook = ttk.Notebook(self.root)
@@ -3276,6 +3300,30 @@ class ExcelLLMApp:
         notebook.add(self.mail_tab, text="메일 분석")
         notebook.add(self.excel_tab, text="Excel 분석")
         notebook.select(self.mail_tab)
+
+    def _load_mail_login_settings(self):
+        settings = load_local_ui_settings()
+        mail_login = settings.get("mail_login", {}) if isinstance(settings, dict) else {}
+        self.mail_fetch_user_var.set(str(mail_login.get("user_id", "")))
+        self.mail_fetch_password_var.set(str(mail_login.get("password", "")))
+
+    def _bind_mail_setting_traces(self):
+        if self._settings_trace_ready:
+            return
+        self.mail_fetch_user_var.trace_add("write", self._on_mail_login_setting_changed)
+        self.mail_fetch_password_var.trace_add("write", self._on_mail_login_setting_changed)
+        self._settings_trace_ready = True
+
+    def _on_mail_login_setting_changed(self, *args):
+        self._save_mail_login_settings()
+
+    def _save_mail_login_settings(self):
+        save_local_ui_settings({
+            "mail_login": {
+                "user_id": self.mail_fetch_user_var.get(),
+                "password": self.mail_fetch_password_var.get(),
+            }
+        })
 
     def _build_excel_tab(self, parent: ttk.Frame):
         top = ttk.Frame(parent, padding=12)
@@ -3510,24 +3558,6 @@ class ExcelLLMApp:
             values=list(MAIL_HTML_STYLE_MAP.keys()),
         )
         self.mail_html_style_combo.pack(side="left")
-        ttk.Label(option_frame, text="답장 스타일", width=10).pack(side="left", padx=(14, 0))
-        self.mail_reply_style_combo = ttk.Combobox(
-            option_frame,
-            textvariable=self.mail_reply_style_var,
-            state="readonly",
-            width=12,
-            values=list(REPLY_STYLE_GUIDES.keys()),
-        )
-        self.mail_reply_style_combo.pack(side="left")
-        ttk.Label(option_frame, text="인사말 모드", width=10).pack(side="left", padx=(14, 0))
-        self.mail_greeting_mode_combo = ttk.Combobox(
-            option_frame,
-            textvariable=self.mail_greeting_mode_var,
-            state="readonly",
-            width=10,
-            values=list(REPLY_GREETING_MODES.keys()),
-        )
-        self.mail_greeting_mode_combo.pack(side="left")
 
         body_frame = ttk.LabelFrame(input_frame, text="메일 본문", padding=6)
         body_frame.pack(fill="both", expand=True)
@@ -3554,6 +3584,24 @@ class ExcelLLMApp:
         self.mail_btn_summary.pack(side="left", padx=(0, 6))
         self.mail_btn_reply = ttk.Button(top_row, text="자동 답장문구 생성", command=self.on_mail_reply)
         self.mail_btn_reply.pack(side="left", padx=(0, 6))
+        ttk.Label(top_row, text="답장 스타일", foreground="#47617c").pack(side="left", padx=(10, 4))
+        self.mail_reply_style_combo = ttk.Combobox(
+            top_row,
+            textvariable=self.mail_reply_style_var,
+            state="readonly",
+            width=10,
+            values=list(REPLY_STYLE_GUIDES.keys()),
+        )
+        self.mail_reply_style_combo.pack(side="left", padx=(0, 6))
+        ttk.Label(top_row, text="인사말", foreground="#47617c").pack(side="left", padx=(8, 4))
+        self.mail_greeting_mode_combo = ttk.Combobox(
+            top_row,
+            textvariable=self.mail_greeting_mode_var,
+            state="readonly",
+            width=8,
+            values=list(REPLY_GREETING_MODES.keys()),
+        )
+        self.mail_greeting_mode_combo.pack(side="left")
 
         bottom_row = ttk.Frame(action_frame)
         bottom_row.pack(fill="x")
