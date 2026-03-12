@@ -1659,10 +1659,164 @@ def normalize_mail_text(text: str) -> str:
     return cleaned
 
 
-def build_mail_summary_prompt(subject: str, body: str) -> str:
+MAIL_TYPE_KEYWORDS = {
+    "승인/검토 요청": ["검토 부탁", "검토 요청", "승인 부탁", "승인 요청", "review", "approve"],
+    "요청": ["부탁드립니다", "요청드립니다", "회신 부탁", "전달 부탁", "지원 부탁"],
+    "일정": ["일정", "회의", "미팅", "금요일", "내일", "오늘", "까지", "오전", "오후"],
+    "이슈/장애": ["이슈", "장애", "오류", "문제", "긴급", "ERR", "error"],
+    "보고": ["보고드립니다", "보고 드립니다", "실적", "현황 공유", "결과 공유"],
+    "공유": ["공유드립니다", "전달드립니다", "참고 부탁", "안내드립니다"],
+    "문의": ["문의", "질문", "확인 가능", "확인 부탁드립니다", "알려주세요"],
+}
+
+REQUEST_LINE_PATTERN = re.compile(r"(부탁드립니다|요청드립니다|회신 부탁|검토 부탁|확인 부탁|공유 부탁|전달 부탁)")
+CHECK_LINE_PATTERN = re.compile(r"(확인 필요|검토 필요|체크 필요|확인 부탁|검토 부탁|알려주세요)")
+DEADLINE_PATTERN = re.compile(r"((\d{1,2}월\s?\d{1,2}일|\d{1,2}/\d{1,2}|\d{4}-\d{1,2}-\d{1,2}|오늘|내일|모레|금주|이번 주|차주|다음 주).{0,12}(까지|전까지|마감|오전|오후))")
+SCHEDULE_PATTERN = re.compile(r"(\d{1,2}월\s?\d{1,2}일|\d{1,2}/\d{1,2}|\d{4}-\d{1,2}-\d{1,2}|오늘|내일|모레|금주|이번 주|차주|다음 주|오전\s?\d{1,2}시|오후\s?\d{1,2}시|회의|미팅)")
+OWNER_PATTERN = re.compile(r"([가-힣A-Za-z0-9]+(?:팀|실|파트|센터|부서|책임|님))")
+
+
+def split_mail_lines(text: str) -> list[str]:
+    return [line.strip() for line in normalize_mail_text(text).splitlines() if line.strip()]
+
+
+def infer_mail_type_hint(subject: str, body: str) -> dict:
+    combined = f"{subject}\n{body}".lower()
+    scores = {}
+    for mail_type, keywords in MAIL_TYPE_KEYWORDS.items():
+        score = sum(1 for keyword in keywords if keyword.lower() in combined)
+        if score > 0:
+            scores[mail_type] = score
+    if not scores:
+        return {"mail_type": "기타", "reason": "뚜렷한 유형 키워드가 명시되지 않음"}
+    best_type = sorted(scores.items(), key=lambda item: (-item[1], item[0]))[0][0]
+    return {"mail_type": best_type, "reason": f"키워드 기반 힌트: {best_type}"}
+
+
+def extract_mail_rule_hints(subject: str, body: str) -> dict:
+    lines = split_mail_lines(body)
+    requests = []
+    check_items = []
+    schedule_mentions = []
+    deadline_mentions = []
+    owner_candidates = []
+
+    for line in lines:
+        if REQUEST_LINE_PATTERN.search(line):
+            requests.append(line)
+        if CHECK_LINE_PATTERN.search(line):
+            check_items.append(line)
+        deadline_mentions.extend(match[0] for match in DEADLINE_PATTERN.findall(line))
+        schedule_mentions.extend(match for match in SCHEDULE_PATTERN.findall(line))
+        owner_candidates.extend(match for match in OWNER_PATTERN.findall(line))
+
+    hint = infer_mail_type_hint(subject, body)
+    return {
+        "mail_type_hint": hint["mail_type"],
+        "mail_type_reason_hint": hint["reason"],
+        "requests": dedupe_preserve_order(requests)[:5],
+        "check_items": dedupe_preserve_order(check_items)[:5],
+        "schedule_mentions": dedupe_preserve_order(schedule_mentions)[:5],
+        "deadline_mentions": dedupe_preserve_order(deadline_mentions)[:5],
+        "owner_candidates": dedupe_preserve_order(owner_candidates)[:5],
+    }
+
+
+def parse_json_object_from_text(text: str) -> dict | None:
+    if not text:
+        return None
+    stripped = text.strip()
+    candidates = [stripped]
+    start = stripped.find("{")
+    end = stripped.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(stripped[start:end + 1])
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def normalize_mail_structure_result(structured_info: dict | None, subject: str, body: str, hints: dict) -> dict:
+    structured_info = structured_info or {}
+    return {
+        "mail_type": structured_info.get("mail_type") or hints.get("mail_type_hint") or "기타",
+        "mail_type_reason": structured_info.get("mail_type_reason") or hints.get("mail_type_reason_hint") or "명시되지 않음",
+        "summary_one_line": structured_info.get("summary_one_line") or "명시되지 않음",
+        "key_points": (structured_info.get("key_points") or [])[:3],
+        "requests": dedupe_preserve_order((structured_info.get("requests") or []) + hints.get("requests", []))[:5],
+        "check_items": dedupe_preserve_order((structured_info.get("check_items") or []) + hints.get("check_items", []))[:5],
+        "schedule_mentions": dedupe_preserve_order((structured_info.get("schedule_mentions") or []) + hints.get("schedule_mentions", []))[:5],
+        "deadline_mentions": dedupe_preserve_order((structured_info.get("deadline_mentions") or []) + hints.get("deadline_mentions", []))[:5],
+        "owner_candidates": dedupe_preserve_order((structured_info.get("owner_candidates") or []) + hints.get("owner_candidates", []))[:5],
+        "risk_notes": (structured_info.get("risk_notes") or [])[:5],
+        "subject": subject.strip() if subject else "",
+        "body": body,
+        "rule_hints": hints,
+    }
+
+
+def format_mail_structure_result(structured_info: dict) -> str:
+    def format_list(title: str, items: list[str], bullet: str = "-") -> list[str]:
+        if items:
+            return [f"[{title}]"] + [f"{bullet} {item}" for item in items]
+        return [f"[{title}]", "- 명시되지 않음"]
+
+    lines = ["===== 메일 구조화 분석 ====="]
+    lines.extend(format_list("메일 유형", [f"{structured_info.get('mail_type', '기타')} ({structured_info.get('mail_type_reason', '명시되지 않음')})"]))
+    lines.extend(format_list("요청사항", structured_info.get("requests", [])))
+    lines.extend(format_list("확인 필요", structured_info.get("check_items", [])))
+    lines.extend(format_list("일정", structured_info.get("schedule_mentions", [])))
+    lines.extend(format_list("마감", structured_info.get("deadline_mentions", [])))
+    lines.extend(format_list("관련자 후보", structured_info.get("owner_candidates", [])))
+    return "\n".join(lines)
+
+
+def build_mail_structure_prompt(subject: str, body: str) -> str:
+    normalized_body = normalize_mail_text(body)
+    hints = extract_mail_rule_hints(subject, normalized_body)
+    payload = {
+        "subject": subject.strip() if subject else "",
+        "body": normalized_body,
+        "rule_hints": hints,
+    }
+    return f"""
+다음 메일을 실무 기준으로 구조화 분석하세요.
+
+규칙:
+- 메일 본문에 없는 사실을 만들지 마세요.
+- 요청/일정/기한을 우선 정리하세요.
+- 애매한 것은 '명시되지 않음' 또는 '추정'으로 처리하세요.
+- JSON만 출력하세요.
+- 아래 스키마를 따르세요.
+
+{{
+  "mail_type": "요청|보고|공유|일정|승인/검토 요청|문의|이슈/장애|기타",
+  "mail_type_reason": "...",
+  "summary_one_line": "...",
+  "key_points": ["...", "...", "..."],
+  "requests": ["..."],
+  "check_items": ["..."],
+  "schedule_mentions": ["..."],
+  "deadline_mentions": ["..."],
+  "owner_candidates": ["..."],
+  "risk_notes": ["..."]
+}}
+
+메일 데이터(JSON):
+{json.dumps(payload, ensure_ascii=False, indent=2)}
+    """.strip()
+
+
+def build_mail_summary_prompt(subject: str, body: str, structured_info: dict | None = None) -> str:
     payload = {
         "subject": subject.strip() if subject else "",
         "body": normalize_mail_text(body),
+        "structured_info": structured_info or {},
     }
     return f"""
 다음 메일을 한국어로 간결하게 요약하세요.
@@ -1672,26 +1826,35 @@ def build_mail_summary_prompt(subject: str, body: str) -> str:
 - 요청사항이 있으면 분리해서 적으세요.
 - 일정/기한 언급이 있으면 짚으세요.
 - 없는 사실을 추정하지 마세요.
+- 구조화 분석 결과가 있으면 그것을 우선 사용하세요.
 - 아래 형식을 유지하세요.
 
+===== 메일 핵심 요약 =====
+[메일 유형]
+...
 [한줄 요약]
 ...
 [핵심 포인트]
 1. ...
 2. ...
 3. ...
-[요청/확인 필요]
-...
+[요청사항]
+- ...
+[확인 필요]
+- ...
+[일정/기한]
+- ...
 
 메일 데이터(JSON):
 {json.dumps(payload, ensure_ascii=False, indent=2)}
     """.strip()
 
 
-def build_mail_reply_prompt(subject: str, body: str) -> str:
+def build_mail_reply_prompt(subject: str, body: str, structured_info: dict | None = None) -> str:
     payload = {
         "subject": subject.strip() if subject else "",
         "body": normalize_mail_text(body),
+        "structured_info": structured_info or {},
     }
     return f"""
 다음 메일에 대한 한국어 업무 메일 답장 초안을 작성하세요.
@@ -1703,8 +1866,11 @@ def build_mail_reply_prompt(subject: str, body: str) -> str:
 - 원문 근거 없는 확답은 금지합니다.
 - 불확실한 내용은 '확인 후 회신드리겠습니다'처럼 중립적으로 표현하세요.
 - 요청 수락/보류/확인 중 모두 가능한 중립적 표현을 허용합니다.
+- mail_type, request list, check_items, deadline/schedule mentions가 있으면 반영하세요.
 - 아래 형식을 유지하세요.
 
+[메일 유형]
+...
 [답장 초안]
 안녕하세요...
 
@@ -1713,25 +1879,47 @@ def build_mail_reply_prompt(subject: str, body: str) -> str:
     """.strip()
 
 
-def analyze_mail_summary(subject: str, body: str) -> str:
+def structure_mail_content(subject: str, body: str) -> dict:
     normalized_body = normalize_mail_text(body)
     if not normalized_body:
         raise RuntimeError("메일 본문이 비어 있습니다.")
 
     system_prompt = (
-        "당신은 한국어 업무 메일을 빠르게 읽고 핵심만 정리해주는 비서입니다. "
-        "없는 사실은 만들지 말고, 요청사항과 일정이 있으면 분리해서 적으세요."
+        "당신은 한국어 업무 메일을 실무 관점에서 구조화 분석하는 비서입니다. "
+        "없는 사실은 만들지 말고, 요청/확인 필요/일정/기한/관련자를 우선 정리하세요. "
+        "반드시 JSON만 출력하세요."
     )
+    hints = extract_mail_rule_hints(subject, normalized_body)
     result = call_gpt_oss(
-        prompt=build_mail_summary_prompt(subject, normalized_body),
+        prompt=build_mail_structure_prompt(subject, normalized_body),
         system_prompt=system_prompt,
         temperature=0.2,
         max_tokens=1200,
     )
-    return "===== 메일 핵심 요약 =====\n" + extract_llm_text(result)
+    llm_text = extract_llm_text(result)
+    parsed = parse_json_object_from_text(llm_text)
+    return normalize_mail_structure_result(parsed, subject, normalized_body, hints)
 
 
-def analyze_mail_reply(subject: str, body: str) -> str:
+def summarize_mail_content(subject: str, body: str, structured_info: dict | None = None) -> str:
+    normalized_body = normalize_mail_text(body)
+    if not normalized_body:
+        raise RuntimeError("메일 본문이 비어 있습니다.")
+
+    system_prompt = (
+        "당신은 한국어 업무 메일을 빠르게 읽고 실무자가 바로 행동할 수 있게 요약해주는 비서입니다. "
+        "없는 사실은 만들지 말고, 요청사항과 일정이 있으면 분리해서 적으세요."
+    )
+    result = call_gpt_oss(
+        prompt=build_mail_summary_prompt(subject, normalized_body, structured_info=structured_info),
+        system_prompt=system_prompt,
+        temperature=0.2,
+        max_tokens=1200,
+    )
+    return extract_llm_text(result)
+
+
+def generate_mail_reply(subject: str, body: str, structured_info: dict | None = None) -> str:
     normalized_body = normalize_mail_text(body)
     if not normalized_body:
         raise RuntimeError("메일 본문이 비어 있습니다.")
@@ -1741,12 +1929,53 @@ def analyze_mail_reply(subject: str, body: str) -> str:
         "정중하고 간결하게 쓰되, 근거 없는 확답과 사실 추가는 금지합니다."
     )
     result = call_gpt_oss(
-        prompt=build_mail_reply_prompt(subject, normalized_body),
+        prompt=build_mail_reply_prompt(subject, normalized_body, structured_info=structured_info),
         system_prompt=system_prompt,
         temperature=0.2,
         max_tokens=1200,
     )
-    return "===== 자동 답장문구 =====\n" + extract_llm_text(result)
+    return extract_llm_text(result)
+
+
+def run_mail_analysis(mode: str, subject: str, body: str) -> dict:
+    normalized_body = normalize_mail_text(body)
+    if not normalized_body:
+        raise RuntimeError("메일 본문이 비어 있습니다.")
+
+    structured_info = structure_mail_content(subject, normalized_body)
+    if mode == "structure":
+        return {
+            "mode": mode,
+            "structured_info": structured_info,
+            "result_text": format_mail_structure_result(structured_info),
+        }
+    if mode == "summary":
+        summary_text = summarize_mail_content(subject, normalized_body, structured_info=structured_info)
+        return {
+            "mode": mode,
+            "structured_info": structured_info,
+            "result_text": summary_text,
+        }
+    if mode == "reply":
+        reply_text = generate_mail_reply(subject, normalized_body, structured_info=structured_info)
+        return {
+            "mode": mode,
+            "structured_info": structured_info,
+            "result_text": reply_text,
+        }
+    raise RuntimeError(f"지원하지 않는 메일 분석 모드입니다: {mode}")
+
+
+def analyze_mail_structure(subject: str, body: str) -> str:
+    return run_mail_analysis("structure", subject, body)["result_text"]
+
+
+def analyze_mail_summary(subject: str, body: str) -> str:
+    return run_mail_analysis("summary", subject, body)["result_text"]
+
+
+def analyze_mail_reply(subject: str, body: str) -> str:
+    return run_mail_analysis("reply", subject, body)["result_text"]
 
 
 def analyze_selection_data(selection_data: dict, mode: str, config: AnalysisConfig | None = None) -> dict:
@@ -1980,6 +2209,19 @@ MAIL_SAMPLE_CASES = [
 확인 부탁드립니다.
         """,
     },
+    {
+        "name": "issue_review_request",
+        "subject": "고객 장애 이슈 검토 요청",
+        "body": """
+안녕하세요.
+
+어제 저녁부터 고객사에서 로그인 오류가 반복 발생하고 있습니다.
+플랫폼개발팀 확인 부탁드리며, 원인 파악 후 오늘 오후 3시 전까지 1차 공유 가능 여부 회신 부탁드립니다.
+필요 시 홍길동 책임도 함께 검토 부탁드립니다.
+
+감사합니다.
+        """,
+    },
 ]
 
 
@@ -1990,6 +2232,26 @@ def test_mail_prompts():
         print(build_mail_summary_prompt(case["subject"], case["body"]))
         print(f"\n=== {case['name']} / reply ===")
         print(build_mail_reply_prompt(case["subject"], case["body"]))
+
+
+def test_mail_structure_prompts():
+    print("[Mail structure prompt tests]")
+    for case in MAIL_SAMPLE_CASES:
+        print(f"\n=== {case['name']} / structure ===")
+        print(build_mail_structure_prompt(case["subject"], case["body"]))
+
+
+def test_mail_summary_prompts():
+    print("[Mail summary prompt tests]")
+    for case in MAIL_SAMPLE_CASES:
+        structured_info = normalize_mail_structure_result(
+            None,
+            case["subject"],
+            normalize_mail_text(case["body"]),
+            extract_mail_rule_hints(case["subject"], case["body"]),
+        )
+        print(f"\n=== {case['name']} / summary ===")
+        print(build_mail_summary_prompt(case["subject"], case["body"], structured_info=structured_info))
 
 
 # =========================================================
@@ -2022,6 +2284,7 @@ class ExcelLLMApp:
         self.exclude_total_rows_var = tk.BooleanVar(value=True)
         self.apply_merge_candidates_var = tk.BooleanVar(value=False)
         self.use_first_row_header_var = tk.BooleanVar(value=True)
+        self.mail_structured_info: dict | None = None
 
         self._build_ui()
 
@@ -2191,6 +2454,8 @@ class ExcelLLMApp:
 
         btn_frame = ttk.Frame(top)
         btn_frame.pack(fill="x", pady=(0, 10))
+        self.mail_btn_structure = ttk.Button(btn_frame, text="구조화 분석", command=self.on_mail_structure)
+        self.mail_btn_structure.pack(side="left", padx=(0, 8))
         self.mail_btn_summary = ttk.Button(btn_frame, text="핵심 요약", command=self.on_mail_summary)
         self.mail_btn_summary.pack(side="left", padx=(0, 8))
         self.mail_btn_reply = ttk.Button(btn_frame, text="답장문구 생성", command=self.on_mail_reply)
@@ -2374,40 +2639,47 @@ class ExcelLLMApp:
             raise RuntimeError("메일 본문이 비어 있습니다.")
         return subject, body
 
-    def _run_mail_action(self, action_name: str, analyzer):
+    def _run_mail_action(self, action_name: str, mode: str):
         try:
             subject, body = self._get_mail_inputs()
         except RuntimeError:
             return
 
+        self.mail_btn_structure.config(state="disabled")
         self.mail_btn_summary.config(state="disabled")
         self.mail_btn_reply.config(state="disabled")
         self.set_mail_status(action_name)
 
         def worker():
             try:
-                result_text = analyzer(subject, body)
-                self.root.after(0, lambda: self.append_mail_result(result_text))
+                analysis_result = run_mail_analysis(mode, subject, body)
+                self.mail_structured_info = analysis_result.get("structured_info")
+                self.root.after(0, lambda: self.append_mail_result(analysis_result["result_text"]))
                 self.root.after(0, lambda: self.set_mail_status("완료"))
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror("오류", str(e)))
                 self.root.after(0, lambda: self.set_mail_status("오류 발생"))
             finally:
+                self.root.after(0, lambda: self.mail_btn_structure.config(state="normal"))
                 self.root.after(0, lambda: self.mail_btn_summary.config(state="normal"))
                 self.root.after(0, lambda: self.mail_btn_reply.config(state="normal"))
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def on_mail_structure(self):
+        self._run_mail_action("구조화 분석 중...", "structure")
+
     def on_mail_summary(self):
-        self._run_mail_action("요약 생성 중...", analyze_mail_summary)
+        self._run_mail_action("요약 생성 중...", "summary")
 
     def on_mail_reply(self):
-        self._run_mail_action("답장문구 생성 중...", analyze_mail_reply)
+        self._run_mail_action("답장문구 생성 중...", "reply")
 
     def on_mail_clear(self):
         self.mail_subject_entry.delete(0, "end")
         self.mail_body_text.delete("1.0", "end")
         self.mail_result_text.delete("1.0", "end")
+        self.mail_structured_info = None
         self.set_mail_status("준비됨")
 
     def on_mail_copy(self):
@@ -2456,6 +2728,12 @@ def main():
         return
     if os.getenv("RUN_MAIL_PROMPT_TESTS") == "1" or "--mail-prompt-test" in sys.argv:
         test_mail_prompts()
+        return
+    if os.getenv("RUN_MAIL_STRUCTURE_PROMPT_TESTS") == "1" or "--mail-structure-prompt-test" in sys.argv:
+        test_mail_structure_prompts()
+        return
+    if os.getenv("RUN_MAIL_SUMMARY_PROMPT_TESTS") == "1" or "--mail-summary-prompt-test" in sys.argv:
+        test_mail_summary_prompts()
         return
     root = tk.Tk()
     ExcelLLMApp(root)
