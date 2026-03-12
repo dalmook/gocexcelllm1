@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 import threading
 import tkinter as tk
 from tkinter import ttk, messagebox
+from tkinter import filedialog
 from tkinter import scrolledtext
 
 import requests
@@ -1937,12 +1938,233 @@ def generate_mail_reply(subject: str, body: str, structured_info: dict | None = 
     return extract_llm_text(result)
 
 
-def run_mail_analysis(mode: str, subject: str, body: str) -> dict:
+def html_escape(text: str) -> str:
+    if text is None:
+        return ""
+    return (
+        str(text)
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&#39;")
+    )
+
+
+def nl2br(text: str) -> str:
+    return html_escape(text).replace("\n", "<br>\n")
+
+
+def render_info_list(items: list[str], empty_text: str = "명시되지 않음") -> str:
+    if not items:
+        return f"<p class='muted'>{html_escape(empty_text)}</p>"
+    return "<ul>" + "".join(f"<li>{html_escape(item)}</li>" for item in items) + "</ul>"
+
+
+def render_section_card(title: str, body_html: str) -> str:
+    return f"""
+    <section class="card">
+      <h2>{html_escape(title)}</h2>
+      <div class="card-body">
+        {body_html}
+      </div>
+    </section>
+    """.strip()
+
+
+def derive_summary_one_line(structured_info: dict, summary_text: str | None, subject: str) -> str:
+    summary_one_line = structured_info.get("summary_one_line")
+    if summary_one_line and summary_one_line != "명시되지 않음":
+        return summary_one_line
+    if summary_text:
+        for line in summary_text.splitlines():
+            line = line.strip()
+            if line and not line.startswith("[") and not line.startswith("="):
+                return line
+    return subject.strip() if subject else "메일 핵심 내용 요약"
+
+
+def extract_reply_direction(reply_text: str | None) -> list[str]:
+    if not reply_text:
+        return []
+    lines = []
+    for line in reply_text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("[") or line.startswith("="):
+            continue
+        lines.append(line)
+    return lines[:3]
+
+
+def build_mail_html_context(subject: str, body: str, structured_info: dict | None = None, summary_info: str | None = None, inspection_info: dict | None = None, reply_info: str | None = None) -> dict:
+    normalized_body = normalize_mail_text(body)
+    structured_info = structured_info or normalize_mail_structure_result(None, subject, normalized_body, extract_mail_rule_hints(subject, normalized_body))
+    title = subject.strip() if subject else structured_info.get("summary_one_line") or "메일 브리핑"
+    summary_one_line = derive_summary_one_line(structured_info, summary_info, subject)
+
+    return {
+        "title": title,
+        "mail_type": structured_info.get("mail_type", "기타"),
+        "mail_type_reason": structured_info.get("mail_type_reason", "명시되지 않음"),
+        "summary_one_line": summary_one_line,
+        "key_points": structured_info.get("key_points") or [],
+        "requests": structured_info.get("requests") or [],
+        "check_items": structured_info.get("check_items") or [],
+        "schedule_mentions": structured_info.get("schedule_mentions") or [],
+        "deadline_mentions": structured_info.get("deadline_mentions") or [],
+        "stakeholder_candidates": structured_info.get("owner_candidates") or [],
+        "risk_notes": structured_info.get("risk_notes") or [],
+        "reply_suggestions": extract_reply_direction(reply_info),
+        "inspection_notes": (inspection_info or {}).get("inspection_notes", []) if inspection_info else [],
+        "summary_info": summary_info or "",
+        "raw_body": normalized_body,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def build_html_style_label(style: str) -> tuple[str, str]:
+    mapping = {
+        "briefing": ("브리핑형", "핵심과 액션을 빠르게 보는 브리핑 스타일"),
+        "meeting": ("회의자료형", "회의 안건과 액션 중심의 자료형 스타일"),
+        "news": ("신문형", "헤드라인과 섹션 중심의 공유문 스타일"),
+    }
+    return mapping.get(style, mapping["briefing"])
+
+
+def build_mail_presentation_html(context: dict, style: str = "briefing") -> str:
+    style_name, style_desc = build_html_style_label(style)
+    requests_html = render_info_list(context.get("requests", []))
+    checks_html = render_info_list(context.get("check_items", []))
+    schedules_html = render_info_list(context.get("schedule_mentions", []))
+    deadlines_html = render_info_list(context.get("deadline_mentions", []))
+    stakeholders_html = render_info_list(context.get("stakeholder_candidates", []))
+    risks_html = render_info_list(context.get("risk_notes", []))
+    reply_html = render_info_list(context.get("reply_suggestions", []), empty_text="추천 회신 방향 없음")
+    key_points_html = render_info_list(context.get("key_points", []), empty_text="핵심 포인트가 명시되지 않음")
+
+    common_css = """
+    body { font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', sans-serif; background: #f4f6f8; color: #1f2933; margin: 0; }
+    .wrap { max-width: 1100px; margin: 0 auto; padding: 32px 24px 48px; }
+    .hero { background: #ffffff; border: 1px solid #d9e2ec; border-radius: 18px; padding: 24px 28px; box-shadow: 0 12px 30px rgba(15, 23, 42, 0.06); }
+    .eyebrow { color: #486581; font-size: 13px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
+    h1 { margin: 10px 0 8px; font-size: 30px; line-height: 1.25; }
+    .subtitle { color: #52606d; font-size: 15px; margin-bottom: 14px; }
+    .summary-line { font-size: 19px; font-weight: 700; color: #102a43; padding: 16px 18px; background: #f0f4f8; border-radius: 12px; }
+    .grid { display: grid; gap: 16px; margin-top: 20px; }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .card { background: #ffffff; border: 1px solid #d9e2ec; border-radius: 16px; padding: 18px 20px; box-shadow: 0 8px 22px rgba(15, 23, 42, 0.04); }
+    h2 { font-size: 17px; margin: 0 0 12px; color: #102a43; }
+    .card-body p, .card-body li { font-size: 14px; line-height: 1.65; color: #243b53; }
+    .card-body ul { padding-left: 20px; margin: 0; }
+    .muted { color: #7b8794; }
+    .quote { background: #f8fafc; border-left: 4px solid #829ab1; padding: 16px; border-radius: 10px; white-space: normal; }
+    .footer { margin-top: 22px; color: #7b8794; font-size: 12px; }
+    .tag { display: inline-block; margin-right: 8px; margin-top: 8px; padding: 6px 10px; border-radius: 999px; background: #e6f1ff; color: #1f4f8a; font-size: 12px; font-weight: 700; }
+    @media (max-width: 860px) { .grid.two, .grid.three { grid-template-columns: 1fr; } }
+    """
+
+    if style == "meeting":
+        body_html = f"""
+        <div class="wrap">
+          <section class="hero">
+            <div class="eyebrow">Meeting Material</div>
+            <h1>{html_escape(context['title'])}</h1>
+            <div class="subtitle">{html_escape(style_desc)}</div>
+            <div class="tag">메일 유형: {html_escape(context['mail_type'])}</div>
+            <div class="summary-line">{html_escape(context['summary_one_line'])}</div>
+          </section>
+          <div class="grid two">
+            {render_section_card("개요", key_points_html)}
+            {render_section_card("액션 아이템", requests_html)}
+            {render_section_card("확인 필요", checks_html)}
+            {render_section_card("일정 / 기한", schedules_html + deadlines_html)}
+            {render_section_card("리스크 / 참고", risks_html)}
+            {render_section_card("추천 회신 방향", reply_html)}
+          </div>
+          {render_section_card("원문 발췌", f"<div class='quote'>{nl2br(context['raw_body'])}</div>")}
+          <div class="footer">생성 시각: {html_escape(context['generated_at'])} | 원문 기반 자동 정리, 없는 사실 미포함 원칙</div>
+        </div>
+        """
+    elif style == "news":
+        body_html = f"""
+        <div class="wrap">
+          <section class="hero">
+            <div class="eyebrow">News Style Brief</div>
+            <h1>{html_escape(context['title'])}</h1>
+            <div class="subtitle">메일 유형: {html_escape(context['mail_type'])} | {html_escape(style_desc)}</div>
+            <div class="summary-line">{html_escape(context['summary_one_line'])}</div>
+          </section>
+          <div class="grid three">
+            {render_section_card("핵심 포인트", key_points_html)}
+            {render_section_card("요청 / 액션", requests_html)}
+            {render_section_card("일정 / 기한", schedules_html + deadlines_html)}
+          </div>
+          <div class="grid two">
+            {render_section_card("확인 필요 / 리스크", checks_html + risks_html)}
+            {render_section_card("관련자 / 회신 방향", stakeholders_html + reply_html)}
+          </div>
+          {render_section_card("참고 원문", f"<div class='quote'>{nl2br(context['raw_body'])}</div>")}
+          <div class="footer">생성 시각: {html_escape(context['generated_at'])} | 공유용 HTML, 원문 근거 중심 구성</div>
+        </div>
+        """
+    else:
+        body_html = f"""
+        <div class="wrap">
+          <section class="hero">
+            <div class="eyebrow">Briefing</div>
+            <h1>{html_escape(context['title'])}</h1>
+            <div class="subtitle">메일 유형: {html_escape(context['mail_type'])} | {html_escape(style_desc)}</div>
+            <div class="summary-line">{html_escape(context['summary_one_line'])}</div>
+          </section>
+          <div class="grid two">
+            {render_section_card("핵심 포인트", key_points_html)}
+            {render_section_card("요청 / 확인 필요", requests_html + checks_html)}
+            {render_section_card("일정 / 기한", schedules_html + deadlines_html)}
+            {render_section_card("관련자 후보", stakeholders_html)}
+            {render_section_card("참고 메모", risks_html + reply_html)}
+            {render_section_card("원문", f"<div class='quote'>{nl2br(context['raw_body'])}</div>")}
+          </div>
+          <div class="footer">생성 시각: {html_escape(context['generated_at'])} | 원문에 없는 사실은 포함하지 않도록 구성</div>
+        </div>
+        """
+
+    return f"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html_escape(context['title'])}</title>
+  <style>
+    {common_css}
+  </style>
+</head>
+<body>
+{body_html}
+</body>
+</html>"""
+
+
+MAIL_HTML_STYLE_MAP = {
+    "브리핑형": "briefing",
+    "회의자료형": "meeting",
+    "신문형": "news",
+}
+
+
+def run_mail_analysis(
+    mode: str,
+    subject: str,
+    body: str,
+    html_style: str = "briefing",
+    structured_info: dict | None = None,
+    summary_text: str | None = None,
+) -> dict:
     normalized_body = normalize_mail_text(body)
     if not normalized_body:
         raise RuntimeError("메일 본문이 비어 있습니다.")
 
-    structured_info = structure_mail_content(subject, normalized_body)
+    structured_info = structured_info or structure_mail_content(subject, normalized_body)
     if mode == "structure":
         return {
             "mode": mode,
@@ -1950,7 +2172,7 @@ def run_mail_analysis(mode: str, subject: str, body: str) -> dict:
             "result_text": format_mail_structure_result(structured_info),
         }
     if mode == "summary":
-        summary_text = summarize_mail_content(subject, normalized_body, structured_info=structured_info)
+        summary_text = summary_text or summarize_mail_content(subject, normalized_body, structured_info=structured_info)
         return {
             "mode": mode,
             "structured_info": structured_info,
@@ -1962,6 +2184,23 @@ def run_mail_analysis(mode: str, subject: str, body: str) -> dict:
             "mode": mode,
             "structured_info": structured_info,
             "result_text": reply_text,
+        }
+    if mode == "html":
+        summary_text = summary_text or summarize_mail_content(subject, normalized_body, structured_info=structured_info)
+        html_context = build_mail_html_context(
+            subject,
+            normalized_body,
+            structured_info=structured_info,
+            summary_info=summary_text,
+        )
+        html_text = build_mail_presentation_html(html_context, style=html_style)
+        return {
+            "mode": mode,
+            "structured_info": structured_info,
+            "summary_text": summary_text,
+            "html_context": html_context,
+            "html_text": html_text,
+            "result_text": html_text,
         }
     raise RuntimeError(f"지원하지 않는 메일 분석 모드입니다: {mode}")
 
@@ -1976,6 +2215,10 @@ def analyze_mail_summary(subject: str, body: str) -> str:
 
 def analyze_mail_reply(subject: str, body: str) -> str:
     return run_mail_analysis("reply", subject, body)["result_text"]
+
+
+def analyze_mail_html(subject: str, body: str, html_style: str = "briefing") -> str:
+    return run_mail_analysis("html", subject, body, html_style=html_style)["result_text"]
 
 
 def analyze_selection_data(selection_data: dict, mode: str, config: AnalysisConfig | None = None) -> dict:
@@ -2254,6 +2497,37 @@ def test_mail_summary_prompts():
         print(build_mail_summary_prompt(case["subject"], case["body"], structured_info=structured_info))
 
 
+def test_mail_html_context():
+    print("[Mail HTML context tests]")
+    for case in MAIL_SAMPLE_CASES:
+        body = normalize_mail_text(case["body"])
+        structured_info = normalize_mail_structure_result(
+            None,
+            case["subject"],
+            body,
+            extract_mail_rule_hints(case["subject"], body),
+        )
+        context = build_mail_html_context(case["subject"], body, structured_info=structured_info)
+        print(f"\n=== {case['name']} / context ===")
+        print(json.dumps(context, ensure_ascii=False, indent=2))
+
+
+def test_mail_html_render():
+    print("[Mail HTML render tests]")
+    for case in MAIL_SAMPLE_CASES:
+        body = normalize_mail_text(case["body"])
+        structured_info = normalize_mail_structure_result(
+            None,
+            case["subject"],
+            body,
+            extract_mail_rule_hints(case["subject"], body),
+        )
+        context = build_mail_html_context(case["subject"], body, structured_info=structured_info)
+        for style in ("briefing", "meeting", "news"):
+            print(f"\n=== {case['name']} / {style} ===")
+            print(build_mail_presentation_html(context, style=style))
+
+
 # =========================================================
 # 7) Tkinter UI
 # =========================================================
@@ -2285,6 +2559,8 @@ class ExcelLLMApp:
         self.apply_merge_candidates_var = tk.BooleanVar(value=False)
         self.use_first_row_header_var = tk.BooleanVar(value=True)
         self.mail_structured_info: dict | None = None
+        self.mail_last_html: str = ""
+        self.mail_html_style_var = tk.StringVar(value="브리핑형")
 
         self._build_ui()
 
@@ -2436,7 +2712,7 @@ class ExcelLLMApp:
 
         desc = ttk.Label(
             top,
-            text="메일 제목과 본문을 붙여넣은 뒤 핵심 요약 또는 답장문구 생성을 실행하세요.",
+            text="메일 제목과 본문을 붙여넣은 뒤 구조화 분석, 요약, 답장문구, 발표용 HTML 생성을 실행하세요.",
             font=("맑은 고딕", 10),
         )
         desc.pack(anchor="w", pady=(4, 10))
@@ -2452,18 +2728,39 @@ class ExcelLLMApp:
         self.mail_body_text = scrolledtext.ScrolledText(body_frame, wrap="word", font=("Consolas", 10), height=14)
         self.mail_body_text.pack(fill="both", expand=True)
 
+        option_frame = ttk.Frame(top)
+        option_frame.pack(fill="x", pady=(0, 8))
+        ttk.Label(option_frame, text="HTML 스타일", width=12).pack(side="left")
+        self.mail_html_style_combo = ttk.Combobox(
+            option_frame,
+            textvariable=self.mail_html_style_var,
+            state="readonly",
+            width=16,
+            values=list(MAIL_HTML_STYLE_MAP.keys()),
+        )
+        self.mail_html_style_combo.pack(side="left")
+
         btn_frame = ttk.Frame(top)
-        btn_frame.pack(fill="x", pady=(0, 10))
+        btn_frame.pack(fill="x", pady=(0, 6))
         self.mail_btn_structure = ttk.Button(btn_frame, text="구조화 분석", command=self.on_mail_structure)
         self.mail_btn_structure.pack(side="left", padx=(0, 8))
         self.mail_btn_summary = ttk.Button(btn_frame, text="핵심 요약", command=self.on_mail_summary)
         self.mail_btn_summary.pack(side="left", padx=(0, 8))
         self.mail_btn_reply = ttk.Button(btn_frame, text="답장문구 생성", command=self.on_mail_reply)
         self.mail_btn_reply.pack(side="left", padx=(0, 8))
+        self.mail_btn_html = ttk.Button(btn_frame, text="발표용 HTML 생성", command=self.on_mail_html_generate)
+        self.mail_btn_html.pack(side="left", padx=(0, 8))
         self.mail_btn_clear = ttk.Button(btn_frame, text="입력 지우기", command=self.on_mail_clear)
         self.mail_btn_clear.pack(side="left", padx=(0, 8))
         self.mail_btn_copy = ttk.Button(btn_frame, text="결과 복사", command=self.on_mail_copy)
         self.mail_btn_copy.pack(side="left", padx=(0, 8))
+
+        html_btn_frame = ttk.Frame(top)
+        html_btn_frame.pack(fill="x", pady=(0, 10))
+        self.mail_btn_copy_html = ttk.Button(html_btn_frame, text="HTML만 복사", command=self.on_mail_copy_html)
+        self.mail_btn_copy_html.pack(side="left", padx=(0, 8))
+        self.mail_btn_save_html = ttk.Button(html_btn_frame, text="HTML 저장", command=self.on_mail_save_html)
+        self.mail_btn_save_html.pack(side="left", padx=(0, 8))
 
         status_frame = ttk.Frame(top)
         status_frame.pack(fill="x", pady=(0, 10))
@@ -2648,12 +2945,15 @@ class ExcelLLMApp:
         self.mail_btn_structure.config(state="disabled")
         self.mail_btn_summary.config(state="disabled")
         self.mail_btn_reply.config(state="disabled")
+        self.mail_btn_html.config(state="disabled")
         self.set_mail_status(action_name)
 
         def worker():
             try:
-                analysis_result = run_mail_analysis(mode, subject, body)
+                analysis_result = run_mail_analysis(mode, subject, body, structured_info=self.mail_structured_info)
                 self.mail_structured_info = analysis_result.get("structured_info")
+                if mode != "html":
+                    self.mail_last_html = ""
                 self.root.after(0, lambda: self.append_mail_result(analysis_result["result_text"]))
                 self.root.after(0, lambda: self.set_mail_status("완료"))
             except Exception as e:
@@ -2663,6 +2963,7 @@ class ExcelLLMApp:
                 self.root.after(0, lambda: self.mail_btn_structure.config(state="normal"))
                 self.root.after(0, lambda: self.mail_btn_summary.config(state="normal"))
                 self.root.after(0, lambda: self.mail_btn_reply.config(state="normal"))
+                self.root.after(0, lambda: self.mail_btn_html.config(state="normal"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2675,11 +2976,51 @@ class ExcelLLMApp:
     def on_mail_reply(self):
         self._run_mail_action("답장문구 생성 중...", "reply")
 
+    def on_mail_html_generate(self):
+        try:
+            subject, body = self._get_mail_inputs()
+        except RuntimeError:
+            return
+
+        style_label = self.mail_html_style_var.get()
+        html_style = MAIL_HTML_STYLE_MAP.get(style_label, "briefing")
+
+        self.mail_btn_structure.config(state="disabled")
+        self.mail_btn_summary.config(state="disabled")
+        self.mail_btn_reply.config(state="disabled")
+        self.mail_btn_html.config(state="disabled")
+        self.set_mail_status("HTML 생성 중...")
+
+        def worker():
+            try:
+                analysis_result = run_mail_analysis(
+                    "html",
+                    subject,
+                    body,
+                    html_style=html_style,
+                    structured_info=self.mail_structured_info,
+                )
+                self.mail_structured_info = analysis_result.get("structured_info")
+                self.mail_last_html = analysis_result.get("html_text", "")
+                self.root.after(0, lambda: self.append_mail_result(analysis_result["result_text"]))
+                self.root.after(0, lambda: self.set_mail_status("완료"))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("오류", str(e)))
+                self.root.after(0, lambda: self.set_mail_status("오류 발생"))
+            finally:
+                self.root.after(0, lambda: self.mail_btn_structure.config(state="normal"))
+                self.root.after(0, lambda: self.mail_btn_summary.config(state="normal"))
+                self.root.after(0, lambda: self.mail_btn_reply.config(state="normal"))
+                self.root.after(0, lambda: self.mail_btn_html.config(state="normal"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def on_mail_clear(self):
         self.mail_subject_entry.delete(0, "end")
         self.mail_body_text.delete("1.0", "end")
         self.mail_result_text.delete("1.0", "end")
         self.mail_structured_info = None
+        self.mail_last_html = ""
         self.set_mail_status("준비됨")
 
     def on_mail_copy(self):
@@ -2690,6 +3031,34 @@ class ExcelLLMApp:
         self.root.clipboard_clear()
         self.root.clipboard_append(content)
         self.set_mail_status("결과를 클립보드에 복사했습니다.")
+
+    def on_mail_copy_html(self):
+        if not self.mail_last_html:
+            messagebox.showinfo("안내", "복사할 HTML 결과가 없습니다.")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.mail_last_html)
+        self.set_mail_status("HTML 복사 완료")
+
+    def on_mail_save_html(self):
+        if not self.mail_last_html:
+            messagebox.showinfo("안내", "저장할 HTML 결과가 없습니다.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="HTML 저장",
+            defaultextension=".html",
+            filetypes=[("HTML Files", "*.html"), ("All Files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fp:
+                fp.write(self.mail_last_html)
+            self.set_mail_status("HTML 저장 완료")
+            messagebox.showinfo("저장 완료", f"HTML 파일을 저장했습니다.\n{path}")
+        except Exception as e:
+            messagebox.showerror("저장 실패", str(e))
+            self.set_mail_status("오류 발생")
 
     def on_copy(self):
         content = self.txt.get("1.0", "end").strip()
@@ -2734,6 +3103,12 @@ def main():
         return
     if os.getenv("RUN_MAIL_SUMMARY_PROMPT_TESTS") == "1" or "--mail-summary-prompt-test" in sys.argv:
         test_mail_summary_prompts()
+        return
+    if os.getenv("RUN_MAIL_HTML_CONTEXT_TESTS") == "1" or "--mail-html-context-test" in sys.argv:
+        test_mail_html_context()
+        return
+    if os.getenv("RUN_MAIL_HTML_RENDER_TESTS") == "1" or "--mail-html-render-test" in sys.argv:
+        test_mail_html_render()
         return
     root = tk.Tk()
     ExcelLLMApp(root)
